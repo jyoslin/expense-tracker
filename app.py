@@ -13,9 +13,32 @@ st.set_page_config(page_title="My Finance", page_icon="💰")
 
 # --- 2. HELPER FUNCTIONS ---
 def get_accounts():
-    """Fetch all accounts sorted by name"""
-    response = supabase.table('accounts').select("*").order('name').execute()
-    return pd.DataFrame(response.data)
+    """Fetch all accounts and sort by usage frequency"""
+    # 1. Get Accounts
+    accounts = supabase.table('accounts').select("*").execute().data
+    df_acc = pd.DataFrame(accounts)
+    
+    # 2. Get Transaction Counts to determine "Popularity"
+    # We fetch just the account IDs from transactions to count them
+    trans_data = supabase.table('transactions').select("from_account_id, to_account_id").execute().data
+    
+    if not trans_data:
+        return df_acc # Return unsorted if no history
+        
+    # Count occurrences
+    all_ids = [t['from_account_id'] for t in trans_data if t['from_account_id']] + \
+              [t['to_account_id'] for t in trans_data if t['to_account_id']]
+    
+    # Create a frequency map {account_id: count}
+    freq = pd.Series(all_ids).value_counts()
+    
+    # Map frequency to the account dataframe (default to 0 if not found)
+    df_acc['usage'] = df_acc['id'].map(freq).fillna(0)
+    
+    # Sort by usage (highest first), then by name
+    df_acc = df_acc.sort_values(by=['usage', 'name'], ascending=[False, True])
+    
+    return df_acc
 
 def get_recent_transactions():
     """Fetch last 10 transactions for history view"""
@@ -76,30 +99,34 @@ tab1, tab2, tab3 = st.tabs(["📝 Entry", "📊 Dashboard", "⚙️ Settings"])
 with tab1:
     st.subheader("New Transaction")
     
+    # STEP 1: Select Type OUTSIDE the form to trigger a refresh
+    trans_type = st.radio("Transaction Type", ["Expense", "Income", "Transfer"], horizontal=True)
+    
+    # STEP 2: The Form
     with st.form("entry_form"):
         col1, col2 = st.columns(2)
-        
         with col1:
             date = st.date_input("Date", datetime.today())
-            amount = st.number_input("Amount ($)", min_value=0.01, format="%.2f")
-        
         with col2:
-            trans_type = st.selectbox("Type", ["Expense", "Income", "Transfer"])
-        
-        # Dynamic Account Selection based on Type
+            amount = st.number_input("Amount ($)", min_value=0.01, format="%.2f")
+
+        # Dynamic Account Selection
         from_account = None
         to_account = None
         
+        # Sort accounts by most used (we will update the get_accounts function later)
+        account_list = df_accounts['name'].tolist()
+
         if trans_type == "Expense":
-            from_account = st.selectbox("Paid From", df_accounts['name'])
+            from_account = st.selectbox("Paid From", account_list)
         elif trans_type == "Income":
-            to_account = st.selectbox("Deposit To", df_accounts['name'])
+            to_account = st.selectbox("Deposit To", account_list)
         elif trans_type == "Transfer":
             col_a, col_b = st.columns(2)
             with col_a:
-                from_account = st.selectbox("From (Source)", df_accounts['name'])
+                from_account = st.selectbox("From (Source)", account_list)
             with col_b:
-                to_account = st.selectbox("To (Destination)", df_accounts['name'])
+                to_account = st.selectbox("To (Destination)", account_list)
 
         desc = st.text_input("Description")
         
@@ -107,27 +134,80 @@ with tab1:
         
         if submitted:
             # Convert names to IDs
-            from_id = account_map[from_account] if from_account else None
-            to_id = account_map[to_account] if to_account else None
+            from_id = account_map.get(from_account)
+            to_id = account_map.get(to_account)
             
-            add_transaction(date, amount, desc, trans_type, from_id, to_id)
-            st.success("Success!")
-            st.rerun()
+            # Basic validation
+            if trans_type == "Transfer" and from_id == to_id:
+                st.error("Source and Destination cannot be the same!")
+            else:
+                add_transaction(date, amount, desc, trans_type, from_id, to_id)
+                st.success("Success!")
+                st.rerun()
 
 # --- TAB 2: DASHBOARD ---
 with tab2:
-    st.subheader("Account Balances")
-    # Show clean table of accounts
-    st.dataframe(df_accounts[['name', 'type', 'balance']], hide_index=True, use_container_width=True)
+    st.subheader("🔍 Account Details")
+    
+    # 1. Select Account to View
+    selected_acc_name = st.selectbox("Select Account to View", df_accounts['name'].tolist())
+    selected_acc_id = account_map[selected_acc_name]
+    
+    # Get current balance
+    curr_bal = df_accounts[df_accounts['id'] == selected_acc_id]['balance'].values[0]
+    st.metric(label="Current Balance", value=f"${curr_bal:,.2f}")
     
     st.divider()
     
-    st.subheader("Recent Activity")
-    df_history = get_recent_transactions()
+    # 2. Fetch Transactions for THIS account only
+    # We need an "OR" filter: where account is Source OR Destination
+    response = supabase.table('transactions').select("*") \
+        .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
+        .order('date', desc=True).execute()
+        
+    df_history = pd.DataFrame(response.data)
+    
     if not df_history.empty:
-        st.dataframe(df_history[['date', 'description', 'amount', 'type']], hide_index=True, use_container_width=True)
+        # Display the table
+        # We format it to look nicer
+        st.dataframe(
+            df_history[['date', 'description', 'amount', 'type', 'id']], 
+            hide_index=True, 
+            use_container_width=True
+        )
+        
+        # 3. DELETE/UNDO FUNCTION
+        st.write("### Correction")
+        col_del, col_confirm = st.columns([2, 1])
+        with col_del:
+            # User types the ID of the transaction to delete (Simple and safe)
+            trans_id_to_del = st.number_input("Enter Transaction ID to Delete (see table above)", min_value=0, step=1)
+        with col_confirm:
+            st.write("") # Spacer
+            st.write("") # Spacer
+            if st.button("🗑️ Delete Transaction"):
+                if trans_id_to_del > 0:
+                    # We need to fetch the transaction first to reverse the balance
+                    tx = supabase.table('transactions').select("*").eq('id', trans_id_to_del).execute().data
+                    if tx:
+                        tx = tx[0]
+                        # Reverse the math
+                        if tx['type'] == "Expense":
+                            update_balance(tx['from_account_id'], tx['amount']) # Add back
+                        elif tx['type'] == "Income":
+                            update_balance(tx['to_account_id'], -tx['amount']) # Remove
+                        elif tx['type'] == "Transfer":
+                            update_balance(tx['from_account_id'], tx['amount']) # Add back to source
+                            update_balance(tx['to_account_id'], -tx['amount']) # Remove from dest
+                        
+                        # Finally delete the row
+                        supabase.table('transactions').delete().eq('id', trans_id_to_del).execute()
+                        st.success("Transaction Deleted & Balance Reverted!")
+                        st.rerun()
+                    else:
+                        st.error("Transaction ID not found.")
     else:
-        st.info("No transactions yet.")
+        st.info("No transactions found for this account.")
 
 # --- TAB 3: SETTINGS ---
 with tab3:
