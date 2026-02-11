@@ -1,7 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 
 # --- 1. SETUP ---
@@ -13,319 +13,236 @@ st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
 # --- 2. HELPER FUNCTIONS ---
 def get_accounts():
-    """Fetch accounts sorted by usage"""
+    """Fetch accounts with new Goal and Flag columns"""
     accounts = supabase.table('accounts').select("*").execute().data
     df_acc = pd.DataFrame(accounts)
-    if df_acc.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance'])
-    
-    # Sort: Put 'Bank' and 'Credit Card' first for easy access
-    df_acc['sort_key'] = df_acc['type'].map({'Bank': 1, 'Credit Card': 2, 'Sinking Fund': 3, 'Custodial': 4}).fillna(5)
-    return df_acc.sort_values(by=['sort_key', 'name'])
-
-def run_scheduled_transactions():
-    """Auto-run due transactions"""
-    today = datetime.today().date()
-    tasks = supabase.table('schedule').select("*").lte('next_run_date', str(today)).execute().data
-    count = 0
-    if tasks:
-        for task in tasks:
-            # Execute
-            add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
-                          task['type'], task['from_account_id'], task['to_account_id'])
-            
-            # Reschedule or Delete
-            if task['frequency'] == 'Monthly':
-                next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
-                supabase.table('schedule').update({"next_run_date": str(next_date)}).eq("id", task['id']).execute()
-            else:
-                supabase.table('schedule').delete().eq("id", task['id']).execute()
-            count += 1
-    return count
+    if df_acc.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date'])
+    return df_acc.sort_values(by=['name'])
 
 def update_balance(account_id, amount_change):
+    if not account_id: return # Skip if no account selected (e.g. untracked cash)
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id):
-    # 1. Record Transaction
+    # Record
     supabase.table('transactions').insert({
         "date": str(date), "amount": amount, "description": description, "type": type,
         "from_account_id": from_acc_id, "to_account_id": to_acc_id
     }).execute()
 
-    # 2. Update Balances
-    if type == "Expense":
-        update_balance(from_acc_id, -amount)
-    elif type in ["Income", "Refund"]:
-        update_balance(to_acc_id, amount)
+    # Update Balances
+    if type == "Expense": update_balance(from_acc_id, -amount)
+    elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
     elif type == "Transfer":
         update_balance(from_acc_id, -amount)
         update_balance(to_acc_id, amount)
     elif type == "Custodial In": 
-        # Special Logic: Money Enters Bank (Asset UP), but Liability also UP (Custodial Account goes Negative)
-        # We treat this as a Transfer from Custodial(Liability) -> Bank
-        update_balance(from_acc_id, -amount) # Liability becomes more negative (You owe more)
-        update_balance(to_acc_id, amount)    # Bank balance increases
+        # Liability Increases (More Negative), Bank Increases
+        update_balance(from_acc_id, -amount) 
+        update_balance(to_acc_id, amount)
+    elif type == "Custodial Out":
+        # Liability Decreases (Less Negative), Bank/Cash Decreases
+        # Note: We handle the logic in the UI button to split multiple sources
+        pass 
 
-def get_projection(target_date, current_accounts):
-    """Calculate future balance based on schedule"""
-    # Get all scheduled items between now and target date
-    today = datetime.today().date()
-    # We need to loop because 'Monthly' items might happen multiple times
-    
-    # Create a copy of current balances to simulate on
-    proj_balances = current_accounts.set_index('id')['balance'].to_dict()
-    
-    # Fetch all active schedules
-    schedules = supabase.table('schedule').select("*").execute().data
-    
-    simulated_log = []
-    
-    for sch in schedules:
-        # Start from the next run date
-        run_date = datetime.strptime(sch['next_run_date'], '%Y-%m-%d').date()
-        
-        while run_date <= target_date:
-            # Simulate the transaction
-            amt = float(sch['amount'])
-            
-            if sch['type'] == 'Expense':
-                proj_balances[sch['from_account_id']] = float(proj_balances.get(sch['from_account_id'], 0)) - amt
-            elif sch['type'] == 'Income':
-                proj_balances[sch['to_account_id']] = float(proj_balances.get(sch['to_account_id'], 0)) + amt
-            elif sch['type'] == 'Transfer':
-                proj_balances[sch['from_account_id']] = float(proj_balances.get(sch['from_account_id'], 0)) - amt
-                proj_balances[sch['to_account_id']] = float(proj_balances.get(sch['to_account_id'], 0)) + amt
-            
-            simulated_log.append({
-                "date": run_date,
-                "desc": sch['description'],
-                "amount": amt,
-                "type": sch['type']
-            })
-            
-            # Move to next occurrence
-            if sch['frequency'] == 'Monthly':
-                run_date += relativedelta(months=1)
-            else:
-                break # One-time only happens once
-                
-    return proj_balances, simulated_log
+def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date):
+    """Save account preferences"""
+    data = {
+        "include_net_worth": include_nw,
+        "is_liquid_asset": is_asset,
+        "goal_amount": goal_amt,
+        "goal_date": str(goal_date) if goal_date else None
+    }
+    supabase.table('accounts').update(data).eq("id", id).execute()
 
 # --- 3. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
-
-# Auto-Run
-processed = run_scheduled_transactions()
-if processed: st.toast(f"Processed {processed} items!", icon="🤖")
 
 df_accounts = get_accounts()
 account_map = dict(zip(df_accounts['name'], df_accounts['id']))
 account_list = df_accounts['name'].tolist()
 
-# TABS RE-ORDERED
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🔮 Projection", "📅 Schedule", "⚙️ Settings"])
+# TABS
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
-# --- TAB 1: OVERVIEW & HISTORY ---
+# --- TAB 1: OVERVIEW (The "Finance Stand") ---
 with tab1:
-    st.subheader("Current Net Worth")
+    st.subheader("Current Finance Stand")
     
-    # 1. High-Level Metrics
-    # We filter accounts to calculate "My Money" vs "Debt"
-    total_assets = df_accounts[df_accounts['type'].isin(['Bank', 'Cash', 'Investment'])]['balance'].sum()
-    total_debt = df_accounts[df_accounts['type'].isin(['Credit Card'])]['balance'].sum()
+    # FILTER DATA BASED ON SETTINGS
+    # 1. Net Worth: Only accounts where 'include_net_worth' is TRUE
+    nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
+    net_worth = nw_accounts['balance'].sum()
     
-    # Custodial is special: It's money you hold that isn't yours.
-    # We add it to Net Worth calculation because it's usually negative (Liability), 
-    # so it correctly subtracts from your total assets.
-    custodial_holdings = df_accounts[df_accounts['type'] == 'Custodial']['balance'].sum() 
+    # 2. Liquid Assets: Only accounts where 'is_liquid_asset' is TRUE (e.g., Banks, Cash)
+    asset_accounts = df_accounts[df_accounts['is_liquid_asset'] == True]
+    total_liquid = asset_accounts['balance'].sum()
     
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Net Worth (My Money)", f"${(total_assets + total_debt + custodial_holdings):,.2f}") 
-    c2.metric("Actual Bank Assets", f"${total_assets:,.2f}")
-    c3.metric("Credit Card Debt", f"${total_debt:,.2f}")
+    c1, c2 = st.columns(2)
+    c1.metric("Net Worth (Configured)", f"${net_worth:,.2f}") 
+    c2.metric("Liquid Bank Assets", f"${total_liquid:,.2f}")
 
     st.divider()
-    
-    # 2. All Accounts Summary Table
-    st.caption("Account Breakdown")
-    st.dataframe(df_accounts[['name', 'type', 'balance']], hide_index=True, use_container_width=True)
-    
-    st.divider()
-    
-    # 3. DRILL-DOWN: The Missing Detail View
-    st.subheader("🔍 Account Details & History")
-    
-    # Select Account to View
-    selected_acc_name = st.selectbox("Select Account to View History", account_list)
-    
-    if selected_acc_name:
-        selected_acc_id = account_map[selected_acc_name]
-        
-        # Fetch History for this specific account
-        # Logic: Get transactions where From OR To is this account
-        history = supabase.table('transactions').select("*") \
-            .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
-            .order('date', desc=True).limit(50).execute().data
-            
-        if history:
-            # Show table
-            st.write(f"**Recent Activity: {selected_acc_name}**")
-            # Show relevant columns
-            st.dataframe(pd.DataFrame(history)[['date', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
-            
-            # 4. DELETE / EDIT FUNCTIONALITY
-            with st.expander("🗑️ Delete a Transaction"):
-                st.write("Made a mistake? Enter the ID from the table above to delete it.")
-                del_id = st.number_input("Transaction ID", min_value=0, step=1, key="del_hist")
-                
-                if st.button("Delete Transaction", key="btn_del_hist"):
-                    # Step A: Fetch transaction to know what to reverse
-                    tx = supabase.table('transactions').select("*").eq('id', del_id).execute().data
-                    if tx:
-                        tx = tx[0]
-                        # Step B: Reverse the Balance Math
-                        if tx['type'] == "Expense": 
-                            update_balance(tx['from_account_id'], tx['amount']) # Add money back
-                        elif tx['type'] in ["Income", "Refund"]: 
-                            update_balance(tx['to_account_id'], -tx['amount']) # Remove money
-                        elif tx['type'] == "Transfer":
-                            update_balance(tx['from_account_id'], tx['amount']) # Add back to source
-                            update_balance(tx['to_account_id'], -tx['amount']) # Remove from dest
-                        elif tx['type'] == "Custodial In":
-                            # Reverse Custodial: Add back to Liability (less negative), Remove from Bank
-                            update_balance(tx['from_account_id'], tx['amount']) 
-                            update_balance(tx['to_account_id'], -tx['amount'])
+    st.write("### Account Breakdown")
+    # Show status icons
+    df_display = df_accounts.copy()
+    df_display['Net Worth?'] = df_display['include_net_worth'].apply(lambda x: "✅" if x else "❌")
+    st.dataframe(df_display[['name', 'balance', 'type', 'Net Worth?']], hide_index=True, use_container_width=True)
 
-                        # Step C: Delete the record
-                        supabase.table('transactions').delete().eq('id', del_id).execute()
-                        st.success("Deleted & Balance Reversed!")
-                        st.rerun()
-                    else:
-                        st.error("Transaction ID not found.")
-        else:
-            st.info("No recent transactions found for this account.")
-
-# --- TAB 2: ENTRY ---
+# --- TAB 2: ENTRY (Now with Split Custodial) ---
 with tab2:
     st.subheader("New Transaction")
-    # Updated Types to include 'Custodial In'
-    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial In", "Refund"], horizontal=True)
+    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial In", "Custodial Out"], horizontal=True)
     
     with st.form("entry"):
         c1, c2 = st.columns(2)
         date = c1.date_input("Date", datetime.today())
-        amt = c2.number_input("Amount", min_value=0.01)
         
-        f_acc, t_acc = None, None
-        
-        if t_type == "Expense":
-            f_acc = st.selectbox("Paid From", account_list)
-        elif t_type in ["Income", "Refund"]:
-            t_acc = st.selectbox("Deposit To", account_list)
-        elif t_type == "Transfer":
-            c_a, c_b = st.columns(2)
-            f_acc = c_a.selectbox("From", account_list)
-            t_acc = c_b.selectbox("To", account_list)
-        elif t_type == "Custodial In":
-            st.info("Someone banked in money to you (Liability increases, Bank Balance increases)")
-            c_a, c_b = st.columns(2)
-            # Find custodial accounts
-            cust_accs = df_accounts[df_accounts['type'] == 'Custodial']['name'].tolist()
-            bank_accs = df_accounts[df_accounts['type'] == 'Bank']['name'].tolist()
+        # --- CUSTODIAL OUT (The Complex Logic) ---
+        if t_type == "Custodial Out":
+            st.info("Paying back custodial money (Split Payment)")
+            cust_acc = st.selectbox("Which Custodial Account are you clearing?", 
+                                    df_accounts[df_accounts['type']=='Custodial']['name'])
             
-            f_acc = c_a.selectbox("Custodial Source (Liability)", cust_accs if cust_accs else account_list)
-            t_acc = c_b.selectbox("Bank Account Received", bank_accs if bank_accs else account_list)
-
-        desc = st.text_input("Description")
-        
-        if st.form_submit_button("Submit"):
-            add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc))
-            st.success("Saved!")
-            st.rerun()
-
-# --- TAB 3: PROJECTION (The Crystal Ball) ---
-with tab3:
-    st.subheader("🔮 Future Balance Projector")
-    st.write("See if you have enough money for upcoming bills.")
-    
-    target_date = st.date_input("Project Until Date", datetime.today() + timedelta(days=30))
-    
-    if st.button("Calculate Projection"):
-        final_balances, logs = get_projection(target_date, df_accounts)
-        
-        # Display Results
-        st.write(f"### Projected Balances on {target_date}")
-        
-        # Create a nice comparison table
-        proj_data = []
-        for index, row in df_accounts.iterrows():
-            curr = row['balance']
-            fut = final_balances.get(row['id'], curr)
-            diff = fut - curr
-            proj_data.append({
-                "Account": row['name'],
-                "Current": f"${curr:,.2f}",
-                "Projected": f"${fut:,.2f}",
-                "Change": f"{diff:+,.2f}"
-            })
+            st.write("--- Sources ---")
+            col_bank, col_cash = st.columns(2)
             
-        st.dataframe(pd.DataFrame(proj_data), hide_index=True, use_container_width=True)
-        
-        if logs:
-            with st.expander("See scheduled items included in this calculation"):
-                st.dataframe(pd.DataFrame(logs))
+            with col_bank:
+                bank_source = st.selectbox("Bank Source", df_accounts[df_accounts['type']=='Bank']['name'])
+                bank_amount = st.number_input("Amount from Bank", min_value=0.0, format="%.2f")
+            
+            with col_cash:
+                # Optional: If you track a physical cash account, select it. If not, we just record it.
+                cash_source_name = st.selectbox("Cash Source", ["Physical Wallet (Untracked)"] + account_list)
+                cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
+            
+            total_out = bank_amount + cash_amount
+            st.metric("Total Being Paid Out", f"${total_out:,.2f}")
+            
+            desc = st.text_input("Description (e.g. Returned to John)")
+            
+            if st.form_submit_button("Process Split Payment"):
+                # 1. Bank Portion
+                if bank_amount > 0:
+                    add_transaction(date, bank_amount, f"{desc} (Bank Part)", "Transfer", 
+                                    account_map[bank_source], account_map[cust_acc])
+                
+                # 2. Cash Portion
+                if cash_amount > 0:
+                    cash_id = account_map.get(cash_source_name) # Will be None if "Untracked"
+                    # If untracked, we just want to reduce the Custodial Liability.
+                    # We treat it as a "Transfer" from Null -> Custodial
+                    # But add_transaction handles balance updates. 
+                    # If cash_id is None, 'update_balance' simply skips the source deduction (which is what we want for untracked cash)
+                    # But we MUST update the destination (Custodial) to reduce liability.
+                    
+                    # We manually insert/update for this edge case to be safe
+                    supabase.table('transactions').insert({
+                        "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash Part)", "type": "Custodial Out",
+                        "from_account_id": cash_id, "to_account_id": account_map[cust_acc]
+                    }).execute()
+                    
+                    # Reduce Liability (Custodial is negative, so we ADD to it to make it closer to 0)
+                    update_balance(account_map[cust_acc], cash_amount)
+                    
+                    # Reduce Cash Account (if it exists)
+                    if cash_id:
+                        update_balance(cash_id, -cash_amount)
+
+                st.success("Split Payment Recorded!")
+                st.rerun()
+
+        # --- STANDARD TRANSACTIONS ---
         else:
-            st.info("No scheduled transactions found for this period.")
-
-# --- TAB 4: SCHEDULE ---
-with tab4:
-    st.subheader("Manage Recurring / Future Payments")
-    # (Simplified for brevity, same logic as before)
-    with st.form("sch_form"):
-        desc = st.text_input("Desc")
-        c1, c2, c3 = st.columns(3)
-        amt = c1.number_input("Amount", min_value=0.01)
-        freq = c2.selectbox("Freq", ["Monthly", "One-Time"])
-        s_date = c3.date_input("Start Date")
-        
-        s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
-        s_f, s_t = None, None
-        if s_type == "Expense": s_f = st.selectbox("From", account_list)
-        elif s_type == "Income": s_t = st.selectbox("To", account_list)
-        elif s_type == "Transfer": 
-            s_f = st.selectbox("From", account_list, key="sf") 
-            s_t = st.selectbox("To", account_list, key="st")
+            amt = c2.number_input("Amount", min_value=0.01)
+            f_acc, t_acc = None, None
             
-        if st.form_submit_button("Add Schedule"):
-            from_id = account_map.get(s_f)
-            to_id = account_map.get(s_t)
-            # Insert into DB
-            supabase.table('schedule').insert({
-                "description": desc, "amount": amt, "type": s_type, 
-                "from_account_id": from_id, "to_account_id": to_id, 
-                "frequency": freq, "next_run_date": str(s_date)
-            }).execute()
-            st.success("Scheduled!")
-            st.rerun()
-            
-    # View Schedule
-    upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
-    if upcoming:
-        st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount']])
-        d_id = st.number_input("ID to Delete", min_value=0)
-        if st.button("Delete Schedule Item"):
-            supabase.table('schedule').delete().eq("id", d_id).execute()
-            st.rerun()
+            if t_type == "Expense": f_acc = st.selectbox("Paid From", account_list)
+            elif t_type in ["Income", "Refund"]: t_acc = st.selectbox("Deposit To", account_list)
+            elif t_type == "Transfer":
+                c_a, c_b = st.columns(2)
+                f_acc = c_a.selectbox("From", account_list)
+                t_acc = c_b.selectbox("To", account_list)
+            elif t_type == "Custodial In":
+                c_a, c_b = st.columns(2)
+                f_acc = c_a.selectbox("Custodial Source", df_accounts[df_accounts['type']=='Custodial']['name'])
+                t_acc = c_b.selectbox("Bank Received", df_accounts[df_accounts['type']=='Bank']['name'])
 
-# --- TAB 5: SETTINGS ---
+            desc = st.text_input("Description")
+            
+            if st.form_submit_button("Submit"):
+                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc))
+                st.success("Saved!")
+                st.rerun()
+
+# --- TAB 3: SINKING FUNDS (Rotating Goals) ---
+with tab3:
+    st.subheader("🎯 Goal Tracker")
+    
+    # Filter only Sinking Funds
+    goals = df_accounts[df_accounts['type'] == 'Sinking Fund']
+    
+    for index, row in goals.iterrows():
+        with st.expander(f"📌 {row['name']} (Current: ${row['balance']:,.2f})", expanded=True):
+            
+            # 1. CHECK IF GOAL MET
+            goal_amt = row['goal_amount'] or 0
+            if row['balance'] >= goal_amt and goal_amt > 0:
+                st.success(f"🎉 GOAL ACHIEVED! Target was ${goal_amt:,.2f}")
+                st.write("### Ready for the next target?")
+                
+                with st.form(f"rotate_goal_{row['id']}"):
+                    new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
+                    new_date = st.date_input("New Deadline")
+                    if st.form_submit_button("🔄 Rotate Goal (Set New Target)"):
+                        update_account_settings(row['id'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date)
+                        st.rerun()
+            
+            # 2. SHOW PROGRESS
+            elif goal_amt > 0:
+                shortfall = goal_amt - row['balance']
+                progress = min(row['balance'] / goal_amt, 1.0)
+                st.progress(progress)
+                st.caption(f"Progress: ${row['balance']:,.2f} / ${goal_amt:,.2f}")
+                
+                # 3. CALCULATE MONTHLY NEED
+                if row['goal_date']:
+                    deadline = datetime.strptime(row['goal_date'], '%Y-%m-%d').date()
+                    today = date.today()
+                    
+                    # Calculate months remaining
+                    months_left = (deadline.year - today.year) * 12 + (deadline.month - today.month)
+                    
+                    if months_left <= 0:
+                        st.error("Deadline Passed!")
+                    else:
+                        monthly_need = shortfall / months_left
+                        st.info(f"💡 You need to save **${monthly_need:,.2f} / month** to reach this by {row['goal_date']}")
+            else:
+                st.warning("No goal set for this fund.")
+
+# --- TAB 5: SETTINGS (Now with Switches) ---
 with tab5:
-    st.write("Create Account")
-    with st.form("create_acc"):
-        name = st.text_input("Name")
-        type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund"])
-        bal = st.number_input("Starting Balance")
-        if st.form_submit_button("Create"):
-            supabase.table('accounts').insert({"name": name, "type": type, "balance": bal}).execute()
-            st.rerun()
+    st.subheader("🔧 Account Configuration")
+    
+    # Edit Existing Accounts
+    edit_acc = st.selectbox("Edit Account", account_list)
+    if edit_acc:
+        row = df_accounts[df_accounts['name'] == edit_acc].iloc[0]
+        
+        with st.form("edit_settings"):
+            c1, c2 = st.columns(2)
+            inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
+            is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
+            
+            st.divider()
+            st.write("Goal Settings (For Sinking Funds)")
+            g_amt = st.number_input("Goal Amount", value=float(row['goal_amount'] or 0))
+            g_date = st.date_input("Goal Deadline", value=datetime.strptime(row['goal_date'], '%Y-%m-%d') if row['goal_date'] else None)
+            
+            if st.form_submit_button("Save Settings"):
+                update_account_settings(row['id'], inc_nw, is_liq, g_amt, g_date)
+                st.success("Updated!")
+                st.rerun()
