@@ -34,13 +34,23 @@ key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
 # --- 2. HELPER FUNCTIONS ---
-def get_accounts():
+def get_accounts(show_inactive=False):
     """Fetch accounts sorted by Custom Sort Order, then Name"""
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
-    if df.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order'])
     
+    # Handle empty DB
+    cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order', 'is_active']
+    if df.empty: return pd.DataFrame(columns=cols)
+    
+    # Ensure columns exist (for legacy data compatibility)
     if 'sort_order' not in df.columns: df['sort_order'] = 99
+    if 'is_active' not in df.columns: df['is_active'] = True
+    
+    # Filter inactive unless requested (e.g. for Settings)
+    if not show_inactive:
+        df = df[df['is_active'] == True]
+        
     return df.sort_values(by=['sort_order', 'name'])
 
 def get_categories(type_filter=None):
@@ -58,15 +68,17 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def update_account_settings(id, name, include_nw, is_asset, goal_amt, goal_date, sort_order):
-    """Save account preferences"""
+def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active):
+    """Save account preferences including Balance Adjustment and Active Status"""
     data = {
         "name": name,
+        "balance": balance, # Direct balance update allowed here
         "include_net_worth": include_nw,
         "is_liquid_asset": is_asset,
         "goal_amount": goal_amt,
         "goal_date": str(goal_date) if goal_date else None,
-        "sort_order": sort_order
+        "sort_order": sort_order,
+        "is_active": is_active
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
 
@@ -120,10 +132,11 @@ manual_due = get_due_manual_tasks()
 if manual_due:
     st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
 
-df_accounts = get_accounts()
-account_map = dict(zip(df_accounts['name'], df_accounts['id']))
-account_list = df_accounts['name'].tolist() if not df_accounts.empty else []
-non_loan_accounts = df_accounts[df_accounts['type'] != 'Loan']['name'].tolist() if not df_accounts.empty else []
+# FETCH ACTIVE ACCOUNTS for Dropdowns
+df_active = get_accounts(show_inactive=False)
+account_map = dict(zip(df_active['name'], df_active['id']))
+account_list = df_active['name'].tolist() if not df_active.empty else []
+non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
@@ -149,9 +162,9 @@ with tab1:
         st.divider()
 
     st.subheader("Current Finance Stand")
-    nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
+    nw_accounts = df_active[df_active['include_net_worth'] == True]
     net_worth = nw_accounts['balance'].sum() if not nw_accounts.empty else 0
-    asset_accounts = df_accounts[df_accounts['is_liquid_asset'] == True]
+    asset_accounts = df_active[df_active['is_liquid_asset'] == True]
     total_liquid = asset_accounts['balance'].sum() if not asset_accounts.empty else 0
     
     c1, c2 = st.columns(2)
@@ -231,12 +244,12 @@ with tab2:
         
         if t_type == "Custodial Out":
             st.info("Paying back custodial money (Split Payment)")
-            cust_acc = st.selectbox("Which Custodial Account?", df_accounts[df_accounts['type']=='Custodial']['name']) if not df_accounts.empty else None
+            cust_acc = st.selectbox("Which Custodial Account?", df_active[df_active['type']=='Custodial']['name']) if not df_active.empty else None
             
             st.write("--- Sources ---")
             col_bank, col_cash = st.columns(2)
             with col_bank:
-                bank_source = st.selectbox("Bank Source", df_accounts[df_accounts['type'].isin(['Bank', 'Cash'])]['name'])
+                bank_source = st.selectbox("Bank Source", df_active[df_active['type'].isin(['Bank', 'Cash'])]['name'])
                 bank_amount = st.number_input("Amount from Bank", min_value=0.0, format="%.2f")
             with col_cash:
                 cash_source_name = st.selectbox("Cash Source", ["Physical Wallet (Untracked)"] + account_list)
@@ -275,8 +288,8 @@ with tab2:
                 t_acc = c_b.selectbox("To", account_list)
             elif t_type == "Custodial In":
                 c_a, c_b = st.columns(2)
-                f_acc = c_a.selectbox("Custodial Source", df_accounts[df_accounts['type']=='Custodial']['name'])
-                t_acc = c_b.selectbox("Bank Received", df_accounts[df_accounts['type']=='Bank']['name'])
+                f_acc = c_a.selectbox("Custodial Source", df_active[df_active['type']=='Custodial']['name'])
+                t_acc = c_b.selectbox("Bank Received", df_active[df_active['type']=='Bank']['name'])
 
             desc = st.text_input("Description")
             if st.form_submit_button("Submit"):
@@ -284,17 +297,16 @@ with tab2:
                 st.success("Saved!")
                 st.rerun()
 
-# --- TAB 3: GOALS (UPDATED!) ---
+# --- TAB 3: GOALS ---
 with tab3:
     st.subheader("🎯 Sinking Funds Dashboard")
-    goals = df_accounts[df_accounts['type'] == 'Sinking Fund']
+    goals = df_active[df_active['type'] == 'Sinking Fund']
     
     if not goals.empty:
-        # 1. GRAND TOTAL SUMMARY
+        # GRAND TOTAL
         total_saved = goals['balance'].sum()
         total_goal = goals['goal_amount'].sum()
         
-        # Avoid division by zero
         if total_goal > 0:
             grand_progress = min(total_saved / total_goal, 1.0)
         else:
@@ -303,13 +315,12 @@ with tab3:
         st.write("### 🏆 Total Progress")
         c_gt1, c_gt2 = st.columns([1, 3])
         c_gt1.metric("Total Saved", f"${total_saved:,.2f}", f"Target: ${total_goal:,.2f}")
-        c_gt2.write("") # Spacer
+        c_gt2.write("")
         c_gt2.write("Overall Completion:")
         c_gt2.progress(grand_progress)
         
         st.divider()
 
-        # 2. INDIVIDUAL FUNDS
         st.write("### Individual Funds")
         for index, row in goals.iterrows():
             with st.expander(f"📌 {row['name']} (Current: ${row['balance']:,.2f})", expanded=True):
@@ -320,7 +331,7 @@ with tab3:
                         new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
                         new_date = st.date_input("New Deadline")
                         if st.form_submit_button("🔄 Rotate Goal"):
-                            update_account_settings(row['id'], row['name'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99))
+                            update_account_settings(row['id'], row['name'], row['balance'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99), row.get('is_active', True))
                             st.rerun()
                 elif goal_amt > 0:
                     shortfall = goal_amt - row['balance']
@@ -333,7 +344,7 @@ with tab3:
                         if months_left > 0:
                             st.info(f"💡 Save **${shortfall / months_left:,.2f} / month**")
     else:
-        st.info("No Sinking Funds created yet. Go to Settings -> Create Account to add one.")
+        st.info("No Sinking Funds created yet.")
 
 # --- TAB 4: SCHEDULE ---
 with tab4:
@@ -414,13 +425,10 @@ with tab5:
             new_name = st.text_input("Name")
             new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
             
-            # DYNAMIC LABEL FOR BALANCE
             bal_label = "Starting Balance"
-            if new_type == "Sinking Fund":
-                bal_label = "Existing Saved Amount (Import from Excel)"
-            elif new_type == "Loan":
-                bal_label = "Current Loan Amount (Negative Value)"
-                
+            if new_type == "Sinking Fund": bal_label = "Existing Saved Amount (Import from Excel)"
+            elif new_type == "Loan": bal_label = "Current Loan Amount (Negative Value)"
+            
             initial_bal = st.number_input(bal_label, value=0.0)
             
             st.write("--- Goal Settings (Sinking Funds Only) ---")
@@ -433,7 +441,8 @@ with tab5:
                     "include_net_worth": True, "is_liquid_asset": True if new_type in ['Bank', 'Cash', 'Investment'] else False,
                     "goal_amount": new_goal if new_type == "Sinking Fund" else 0,
                     "goal_date": str(new_date) if new_type == "Sinking Fund" else None,
-                    "sort_order": 99
+                    "sort_order": 99,
+                    "is_active": True
                 }
                 supabase.table('accounts').insert(data).execute()
                 st.success(f"Created {new_name}!")
@@ -441,18 +450,29 @@ with tab5:
 
     st.divider()
     
-    edit_acc = st.selectbox("Edit Existing Account", account_list)
+    # EDIT ACCOUNT (NOW WITH BALANCE EDIT & ARCHIVE)
+    # We fetch ALL accounts here, including inactive, so you can restore them
+    df_all_accounts = get_accounts(show_inactive=True)
+    edit_list = df_all_accounts['name'].tolist() if not df_all_accounts.empty else []
+    
+    edit_acc = st.selectbox("Edit Existing Account", edit_list)
     if edit_acc:
-        row = df_accounts[df_accounts['name'] == edit_acc].iloc[0]
+        row = df_all_accounts[df_all_accounts['name'] == edit_acc].iloc[0]
         
         with st.form("edit_settings"):
+            st.write(f"Editing: **{row['name']}**")
+            
             c_name, c_sort = st.columns([3, 1])
             upd_name = c_name.text_input("Account Name", value=row['name'])
             upd_sort = c_sort.number_input("Sort Order", value=int(row.get('sort_order', 99)), step=1)
             
-            c1, c2 = st.columns(2)
+            # DIRECT BALANCE EDIT
+            upd_bal = st.number_input("Current Balance (Manual Adjustment)", value=float(row['balance']))
+            
+            c1, c2, c3 = st.columns(3)
             inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
             is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
+            is_active = c3.checkbox("Account is Active?", value=row.get('is_active', True))
             
             g_amt = 0.0
             g_date = None
@@ -463,6 +483,6 @@ with tab5:
                 g_date = st.date_input("Goal Deadline", value=datetime.strptime(row['goal_date'], '%Y-%m-%d') if row['goal_date'] else None)
             
             if st.form_submit_button("Save Changes"):
-                update_account_settings(row['id'], upd_name, inc_nw, is_liq, g_amt, g_date, upd_sort)
+                update_account_settings(row['id'], upd_name, upd_bal, inc_nw, is_liq, g_amt, g_date, upd_sort, is_active)
                 st.success("Updated! Refreshing...")
                 st.rerun()
