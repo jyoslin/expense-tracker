@@ -127,24 +127,85 @@ account_list = df_accounts['name'].tolist()
 # TABS RE-ORDERED
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🔮 Projection", "📅 Schedule", "⚙️ Settings"])
 
-# --- TAB 1: OVERVIEW (The "Finance Stand") ---
+# --- TAB 1: OVERVIEW & HISTORY ---
 with tab1:
     st.subheader("Current Net Worth")
     
-    # Calculate Totals
+    # 1. High-Level Metrics
+    # We filter accounts to calculate "My Money" vs "Debt"
     total_assets = df_accounts[df_accounts['type'].isin(['Bank', 'Cash', 'Investment'])]['balance'].sum()
     total_debt = df_accounts[df_accounts['type'].isin(['Credit Card'])]['balance'].sum()
+    
+    # Custodial is special: It's money you hold that isn't yours.
+    # We add it to Net Worth calculation because it's usually negative (Liability), 
+    # so it correctly subtracts from your total assets.
     custodial_holdings = df_accounts[df_accounts['type'] == 'Custodial']['balance'].sum() 
-    # Note: Custodial is usually negative (liability), meaning money in your bank belongs to others
     
     c1, c2, c3 = st.columns(3)
     c1.metric("Net Worth (My Money)", f"${(total_assets + total_debt + custodial_holdings):,.2f}") 
-    c2.metric("Actual Bank Balance", f"${total_assets:,.2f}")
+    c2.metric("Actual Bank Assets", f"${total_assets:,.2f}")
     c3.metric("Credit Card Debt", f"${total_debt:,.2f}")
 
     st.divider()
+    
+    # 2. All Accounts Summary Table
     st.caption("Account Breakdown")
     st.dataframe(df_accounts[['name', 'type', 'balance']], hide_index=True, use_container_width=True)
+    
+    st.divider()
+    
+    # 3. DRILL-DOWN: The Missing Detail View
+    st.subheader("🔍 Account Details & History")
+    
+    # Select Account to View
+    selected_acc_name = st.selectbox("Select Account to View History", account_list)
+    
+    if selected_acc_name:
+        selected_acc_id = account_map[selected_acc_name]
+        
+        # Fetch History for this specific account
+        # Logic: Get transactions where From OR To is this account
+        history = supabase.table('transactions').select("*") \
+            .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
+            .order('date', desc=True).limit(50).execute().data
+            
+        if history:
+            # Show table
+            st.write(f"**Recent Activity: {selected_acc_name}**")
+            # Show relevant columns
+            st.dataframe(pd.DataFrame(history)[['date', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
+            
+            # 4. DELETE / EDIT FUNCTIONALITY
+            with st.expander("🗑️ Delete a Transaction"):
+                st.write("Made a mistake? Enter the ID from the table above to delete it.")
+                del_id = st.number_input("Transaction ID", min_value=0, step=1, key="del_hist")
+                
+                if st.button("Delete Transaction", key="btn_del_hist"):
+                    # Step A: Fetch transaction to know what to reverse
+                    tx = supabase.table('transactions').select("*").eq('id', del_id).execute().data
+                    if tx:
+                        tx = tx[0]
+                        # Step B: Reverse the Balance Math
+                        if tx['type'] == "Expense": 
+                            update_balance(tx['from_account_id'], tx['amount']) # Add money back
+                        elif tx['type'] in ["Income", "Refund"]: 
+                            update_balance(tx['to_account_id'], -tx['amount']) # Remove money
+                        elif tx['type'] == "Transfer":
+                            update_balance(tx['from_account_id'], tx['amount']) # Add back to source
+                            update_balance(tx['to_account_id'], -tx['amount']) # Remove from dest
+                        elif tx['type'] == "Custodial In":
+                            # Reverse Custodial: Add back to Liability (less negative), Remove from Bank
+                            update_balance(tx['from_account_id'], tx['amount']) 
+                            update_balance(tx['to_account_id'], -tx['amount'])
+
+                        # Step C: Delete the record
+                        supabase.table('transactions').delete().eq('id', del_id).execute()
+                        st.success("Deleted & Balance Reversed!")
+                        st.rerun()
+                    else:
+                        st.error("Transaction ID not found.")
+        else:
+            st.info("No recent transactions found for this account.")
 
 # --- TAB 2: ENTRY ---
 with tab2:
