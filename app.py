@@ -35,11 +35,17 @@ supabase: Client = create_client(url, key)
 
 # --- 2. HELPER FUNCTIONS ---
 def get_accounts():
-    """Fetch accounts"""
+    """Fetch accounts sorted by Custom Sort Order, then Name"""
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
-    if df.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date'])
-    return df.sort_values(by=['name'])
+    if df.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order'])
+    
+    # Ensure sort_order exists (handle legacy data)
+    if 'sort_order' not in df.columns:
+        df['sort_order'] = 99
+        
+    # Sort by Order (Ascending), then Name
+    return df.sort_values(by=['sort_order', 'name'])
 
 def get_categories(type_filter=None):
     """Fetch categories"""
@@ -56,13 +62,14 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date):
-    """Save account preferences"""
+def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date, sort_order):
+    """Save account preferences including Sort Order"""
     data = {
         "include_net_worth": include_nw,
         "is_liquid_asset": is_asset,
         "goal_amount": goal_amt,
-        "goal_date": str(goal_date) if goal_date else None
+        "goal_date": str(goal_date) if goal_date else None,
+        "sort_order": sort_order
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
 
@@ -122,18 +129,22 @@ if manual_due:
 
 df_accounts = get_accounts()
 account_map = dict(zip(df_accounts['name'], df_accounts['id']))
-account_list = df_accounts['name'].tolist()
+# Only create list if dataframe is not empty
+if not df_accounts.empty:
+    account_list = df_accounts['name'].tolist()
+else:
+    account_list = []
 
 # Filter lists for specific logic
 # Loan accounts should not be sources for expenses
-non_loan_accounts = df_accounts[df_accounts['type'] != 'Loan']['name'].tolist()
+non_loan_accounts = df_accounts[df_accounts['type'] != 'Loan']['name'].tolist() if not df_accounts.empty else []
 
 # TABS
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
-    # --- MANUAL TASKS SECTION (New!) ---
+    # --- MANUAL TASKS SECTION ---
     if manual_due:
         st.write("### 🔔 Pending Manual Transfers")
         for task in manual_due:
@@ -157,14 +168,11 @@ with tab1:
 
     st.subheader("Current Finance Stand")
     
-    # Logic: Loans are liabilities (usually negative balance). Investments are Assets.
-    # Net Worth = Assets (Bank + Cash + Investment) - Debts (Credit Card + Loan + Custodial)
-    
     nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
-    net_worth = nw_accounts['balance'].sum()
+    net_worth = nw_accounts['balance'].sum() if not nw_accounts.empty else 0
     
     asset_accounts = df_accounts[df_accounts['is_liquid_asset'] == True]
-    total_liquid = asset_accounts['balance'].sum()
+    total_liquid = asset_accounts['balance'].sum() if not asset_accounts.empty else 0
     
     c1, c2 = st.columns(2)
     c1.metric("Net Worth", f"${net_worth:,.2f}") 
@@ -234,7 +242,7 @@ with tab2:
         # --- CUSTODIAL OUT ---
         if t_type == "Custodial Out":
             st.info("Paying back custodial money (Split Payment)")
-            cust_acc = st.selectbox("Which Custodial Account?", df_accounts[df_accounts['type']=='Custodial']['name'])
+            cust_acc = st.selectbox("Which Custodial Account?", df_accounts[df_accounts['type']=='Custodial']['name']) if not df_accounts.empty else None
             
             st.write("--- Sources ---")
             col_bank, col_cash = st.columns(2)
@@ -309,7 +317,7 @@ with tab3:
                     new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
                     new_date = st.date_input("New Deadline")
                     if st.form_submit_button("🔄 Rotate Goal"):
-                        update_account_settings(row['id'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date)
+                        update_account_settings(row['id'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99))
                         st.rerun()
             elif goal_amt > 0:
                 shortfall = goal_amt - row['balance']
@@ -334,8 +342,7 @@ with tab4:
             s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
             s_date = c3.date_input("Start Date", datetime.today())
             
-            # MANUAL CHECKBOX
-            s_manual = st.checkbox("🔔 Manual Reminder? (Tick this if you do the transfer manually, e.g. PayNow)", value=False)
+            s_manual = st.checkbox("🔔 Manual Reminder? (Tick this if you do the transfer manually)", value=False)
             
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
@@ -364,7 +371,6 @@ with tab4:
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
-        # Format for display
         df_up = pd.DataFrame(upcoming)
         df_up['Manual?'] = df_up['is_manual'].apply(lambda x: "🔔 Manual" if x else "🤖 Auto")
         st.dataframe(df_up[['next_run_date', 'description', 'amount', 'frequency', 'Manual?', 'id']], hide_index=True)
@@ -404,7 +410,6 @@ with tab5:
     with st.expander("➕ Add New Account", expanded=False):
         with st.form("create_acc"):
             new_name = st.text_input("Name")
-            # UPDATED TYPES LIST
             new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
             initial_bal = st.number_input("Starting Balance (Negative for Loan)", value=0.0)
             
@@ -417,7 +422,8 @@ with tab5:
                     "name": new_name, "type": new_type, "balance": initial_bal,
                     "include_net_worth": True, "is_liquid_asset": True if new_type in ['Bank', 'Cash', 'Investment'] else False,
                     "goal_amount": new_goal if new_type == "Sinking Fund" else 0,
-                    "goal_date": str(new_date) if new_type == "Sinking Fund" else None
+                    "goal_date": str(new_date) if new_type == "Sinking Fund" else None,
+                    "sort_order": 99 # Default to bottom
                 }
                 supabase.table('accounts').insert(data).execute()
                 st.success(f"Created {new_name}!")
@@ -425,15 +431,22 @@ with tab5:
 
     st.divider()
     
-    # 3. EDIT ACCOUNT
+    # 3. EDIT ACCOUNT (Now with SORT ORDER)
     edit_acc = st.selectbox("Edit Existing Account", account_list)
     if edit_acc:
         row = df_accounts[df_accounts['name'] == edit_acc].iloc[0]
         
         with st.form("edit_settings"):
+            st.write(f"Editing: **{row['name']}**")
+            
             c1, c2 = st.columns(2)
             inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
             is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
+            
+            st.divider()
+            
+            # --- NEW: SORT ORDER ---
+            sort_val = st.number_input("Sort Order (1 = Top, 99 = Bottom)", value=int(row.get('sort_order', 99)), step=1)
             
             g_amt = 0.0
             g_date = None
@@ -444,6 +457,6 @@ with tab5:
                 g_date = st.date_input("Goal Deadline", value=datetime.strptime(row['goal_date'], '%Y-%m-%d') if row['goal_date'] else None)
             
             if st.form_submit_button("Save Changes"):
-                update_account_settings(row['id'], inc_nw, is_liq, g_amt, g_date)
-                st.success("Updated!")
+                update_account_settings(row['id'], inc_nw, is_liq, g_amt, g_date, sort_val)
+                st.success("Updated! Refreshing...")
                 st.rerun()
