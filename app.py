@@ -1,20 +1,15 @@
 import streamlit as st
+import hmac # <--- THIS WAS MISSING
 from supabase import create_client, Client
 import pandas as pd
 from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 
-# --- 1. SETUP ---
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
-
+# --- 1. SECURITY & SETUP ---
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
-# --- SECURITY: PASSWORD CHECK ---
 def check_password():
     """Returns `True` if the user had the correct password."""
-
     def password_entered():
         """Checks whether a password entered by the user is correct."""
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
@@ -23,21 +18,22 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
-    # Return True if the user has validated their password
     if st.session_state.get("password_correct", False):
         return True
 
-    # Show input for password
     st.text_input("🔒 Please enter your password", type="password", on_change=password_entered, key="password")
-    
     if "password_correct" in st.session_state and not st.session_state["password_correct"]:
         st.error("😕 Password incorrect")
-        
     return False
 
-# STOP THE APP IF PASSWORD IS WRONG
+# STOP APP IF PASSWORD WRONG
 if not check_password():
     st.stop()
+
+# Connect to Supabase
+url = st.secrets["SUPABASE_URL"]
+key = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(url, key)
 
 # --- 2. HELPER FUNCTIONS ---
 def get_accounts():
@@ -86,7 +82,6 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
         update_balance(from_acc_id, -amount)
         update_balance(to_acc_id, amount)
     elif type == "Custodial Out":
-        # Logic: Bank goes down, Liability goes UP (closer to 0/less negative)
         if from_acc_id: update_balance(from_acc_id, -amount) 
         update_balance(to_acc_id, amount)
 
@@ -97,9 +92,8 @@ def run_scheduled_transactions():
     count = 0
     if tasks:
         for task in tasks:
-            # Default category for auto-runs is 'Recurring' or 'Bills'
             add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
-                          task['type'], task['from_account_id'], task['to_account_id'], "Bills")
+                          task['type'], task['from_account_id'], task['to_account_id'], "Recurring")
             
             if task['frequency'] == 'Monthly':
                 next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
@@ -127,7 +121,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goa
 with tab1:
     st.subheader("Current Finance Stand")
     
-    # 1. METRICS
     nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
     net_worth = nw_accounts['balance'].sum()
     
@@ -140,9 +133,8 @@ with tab1:
 
     st.divider()
     
-    # 2. CATEGORY CHART
+    # CATEGORY CHART
     st.subheader("📊 Spending by Category (Last 30 Days)")
-    # Fetch recent expenses
     expenses = supabase.table('transactions').select("*").eq('type', 'Expense').order('date', desc=True).limit(50).execute().data
     if expenses:
         df_exp = pd.DataFrame(expenses)
@@ -159,7 +151,7 @@ with tab1:
 
     st.divider()
     
-    # 3. ACCOUNT HISTORY
+    # ACCOUNT HISTORY
     st.subheader("🔍 Account Details & History")
     selected_acc_name = st.selectbox("Select Account", account_list)
     
@@ -178,7 +170,6 @@ with tab1:
                     tx = supabase.table('transactions').select("*").eq('id', del_id).execute().data
                     if tx:
                         tx = tx[0]
-                        # Reverse Logic
                         if tx['type'] == "Expense": update_balance(tx['from_account_id'], tx['amount'])
                         elif tx['type'] in ["Income", "Refund"]: update_balance(tx['to_account_id'], -tx['amount'])
                         elif tx['type'] in ["Transfer", "Custodial In"]:
@@ -216,14 +207,13 @@ with tab2:
                 cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
             
             desc = st.text_input("Description")
-            category = "Custodial" # Default category
+            category = "Custodial" 
             
             if st.form_submit_button("Process Split Payment"):
                 if bank_amount > 0:
                     add_transaction(date, bank_amount, f"{desc} (Bank)", "Custodial Out", account_map[bank_source], account_map[cust_acc], category)
                 if cash_amount > 0:
                     cash_id = account_map.get(cash_source_name)
-                    # If untracked cash, manually insert to avoid 'from' update error, but update 'to'
                     if not cash_id:
                         supabase.table('transactions').insert({
                             "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
@@ -239,7 +229,6 @@ with tab2:
         else:
             amt = c2.number_input("Amount", min_value=0.01)
             
-            # CATEGORY SELECTOR
             cat_options = get_categories("Income") if t_type == "Income" else get_categories("Expense")
             category = st.selectbox("Category", cat_options)
             
