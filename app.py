@@ -59,7 +59,7 @@ def update_balance(account_id, amount_change):
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
 def update_account_settings(id, name, include_nw, is_asset, goal_amt, goal_date, sort_order):
-    """Save account preferences including Name Change"""
+    """Save account preferences"""
     data = {
         "name": name,
         "include_net_worth": include_nw,
@@ -94,7 +94,6 @@ def run_scheduled_transactions():
     count = 0
     if tasks:
         for task in tasks:
-            # USE SAVED CATEGORY, OR DEFAULT TO 'Recurring'
             cat = task.get('category', 'Recurring')
             add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
                           task['type'], task['from_account_id'], task['to_account_id'], cat)
@@ -161,15 +160,12 @@ with tab1:
 
     st.divider()
     
-    # --- UPGRADED CATEGORY CHART ---
+    # CATEGORY CHART
     st.subheader("📊 Spending by Category")
-    
-    # Date Filter
     col_d1, col_d2 = st.columns(2)
-    start_date = col_d1.date_input("Start Date", date.today().replace(day=1)) # Default to 1st of month
+    start_date = col_d1.date_input("Start Date", date.today().replace(day=1)) 
     end_date = col_d2.date_input("End Date", date.today())
     
-    # Fetch Data with Filter
     expenses = supabase.table('transactions').select("*") \
         .eq('type', 'Expense') \
         .gte('date', str(start_date)) \
@@ -179,25 +175,17 @@ with tab1:
     if expenses:
         df_exp = pd.DataFrame(expenses)
         if 'category' in df_exp.columns and not df_exp.empty:
-            # Summary Chart
             cat_sum = df_exp.groupby('category')['amount'].sum().reset_index().sort_values('amount', ascending=False)
-            
             c_chart, c_list = st.columns([2, 1])
-            with c_chart:
-                st.bar_chart(cat_sum.set_index('category'))
-            with c_list:
-                st.dataframe(cat_sum, hide_index=True, use_container_width=True)
+            with c_chart: st.bar_chart(cat_sum.set_index('category'))
+            with c_list: st.dataframe(cat_sum, hide_index=True, use_container_width=True)
             
-            # Drill Down Details
             st.write("---")
             st.write("**📂 Drill Down: Transaction Details**")
             sel_cat_view = st.selectbox("Select Category to View Details", cat_sum['category'].tolist())
-            
             if sel_cat_view:
-                # Filter df for this category
                 df_detail = df_exp[df_exp['category'] == sel_cat_view]
                 st.dataframe(df_detail[['date', 'description', 'amount']], hide_index=True, use_container_width=True)
-                st.caption(f"Showing {len(df_detail)} transactions for {sel_cat_view}")
     else:
         st.info("No expenses found in this date range.")
 
@@ -206,7 +194,6 @@ with tab1:
     # ACCOUNT HISTORY
     st.subheader("🔍 Account Details & History")
     selected_acc_name = st.selectbox("Select Account", account_list)
-    
     if selected_acc_name:
         selected_acc_id = account_map[selected_acc_name]
         history = supabase.table('transactions').select("*") \
@@ -215,7 +202,6 @@ with tab1:
             
         if history:
             st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
-            
             with st.expander("🗑️ Delete Transaction"):
                 del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
                 if st.button("Delete Transaction"):
@@ -230,7 +216,6 @@ with tab1:
                         elif tx['type'] == "Custodial Out":
                             if tx['from_account_id']: update_balance(tx['from_account_id'], tx['amount'])
                             update_balance(tx['to_account_id'], -tx['amount'])
-                            
                         supabase.table('transactions').delete().eq('id', del_id).execute()
                         st.success("Deleted!")
                         st.rerun()
@@ -282,7 +267,6 @@ with tab2:
             category = st.selectbox("Category", cat_options)
             
             f_acc, t_acc = None, None
-            
             if t_type == "Expense": f_acc = st.selectbox("Paid From", non_loan_accounts)
             elif t_type in ["Income", "Refund"]: t_acc = st.selectbox("Deposit To", account_list)
             elif t_type == "Transfer":
@@ -300,32 +284,56 @@ with tab2:
                 st.success("Saved!")
                 st.rerun()
 
-# --- TAB 3: GOALS ---
+# --- TAB 3: GOALS (UPDATED!) ---
 with tab3:
-    st.subheader("🎯 Goal Tracker")
+    st.subheader("🎯 Sinking Funds Dashboard")
     goals = df_accounts[df_accounts['type'] == 'Sinking Fund']
     
-    for index, row in goals.iterrows():
-        with st.expander(f"📌 {row['name']} (Current: ${row['balance']:,.2f})", expanded=True):
-            goal_amt = row['goal_amount'] or 0
-            if row['balance'] >= goal_amt and goal_amt > 0:
-                st.success("🎉 GOAL ACHIEVED!")
-                with st.form(f"rotate_goal_{row['id']}"):
-                    new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
-                    new_date = st.date_input("New Deadline")
-                    if st.form_submit_button("🔄 Rotate Goal"):
-                        update_account_settings(row['id'], row['name'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99))
-                        st.rerun()
-            elif goal_amt > 0:
-                shortfall = goal_amt - row['balance']
-                progress = min(row['balance'] / goal_amt, 1.0)
-                st.progress(progress)
-                st.caption(f"Target: ${goal_amt:,.2f}")
-                if row['goal_date']:
-                    deadline = datetime.strptime(row['goal_date'], '%Y-%m-%d').date()
-                    months_left = (deadline.year - date.today().year) * 12 + (deadline.month - date.today().month)
-                    if months_left > 0:
-                        st.info(f"💡 Save **${shortfall / months_left:,.2f} / month**")
+    if not goals.empty:
+        # 1. GRAND TOTAL SUMMARY
+        total_saved = goals['balance'].sum()
+        total_goal = goals['goal_amount'].sum()
+        
+        # Avoid division by zero
+        if total_goal > 0:
+            grand_progress = min(total_saved / total_goal, 1.0)
+        else:
+            grand_progress = 0.0
+            
+        st.write("### 🏆 Total Progress")
+        c_gt1, c_gt2 = st.columns([1, 3])
+        c_gt1.metric("Total Saved", f"${total_saved:,.2f}", f"Target: ${total_goal:,.2f}")
+        c_gt2.write("") # Spacer
+        c_gt2.write("Overall Completion:")
+        c_gt2.progress(grand_progress)
+        
+        st.divider()
+
+        # 2. INDIVIDUAL FUNDS
+        st.write("### Individual Funds")
+        for index, row in goals.iterrows():
+            with st.expander(f"📌 {row['name']} (Current: ${row['balance']:,.2f})", expanded=True):
+                goal_amt = row['goal_amount'] or 0
+                if row['balance'] >= goal_amt and goal_amt > 0:
+                    st.success("🎉 GOAL ACHIEVED!")
+                    with st.form(f"rotate_goal_{row['id']}"):
+                        new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
+                        new_date = st.date_input("New Deadline")
+                        if st.form_submit_button("🔄 Rotate Goal"):
+                            update_account_settings(row['id'], row['name'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99))
+                            st.rerun()
+                elif goal_amt > 0:
+                    shortfall = goal_amt - row['balance']
+                    progress = min(row['balance'] / goal_amt, 1.0)
+                    st.progress(progress)
+                    st.caption(f"Target: ${goal_amt:,.2f}")
+                    if row['goal_date']:
+                        deadline = datetime.strptime(row['goal_date'], '%Y-%m-%d').date()
+                        months_left = (deadline.year - date.today().year) * 12 + (deadline.month - date.today().month)
+                        if months_left > 0:
+                            st.info(f"💡 Save **${shortfall / months_left:,.2f} / month**")
+    else:
+        st.info("No Sinking Funds created yet. Go to Settings -> Create Account to add one.")
 
 # --- TAB 4: SCHEDULE ---
 with tab4:
@@ -339,9 +347,7 @@ with tab4:
             s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
             s_date = c3.date_input("Start Date", datetime.today())
             
-            # CATEGORY SELECTION (New!)
             s_cat = st.selectbox("Category", get_categories())
-            
             s_manual = st.checkbox("🔔 Manual Reminder? (Tick if you do the transfer manually)", value=False)
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
@@ -370,7 +376,6 @@ with tab4:
         st.write("### 🗓️ Upcoming Items")
         df_up = pd.DataFrame(upcoming)
         df_up['Manual?'] = df_up['is_manual'].apply(lambda x: "🔔 Manual" if x else "🤖 Auto")
-        # Handle cases where old schedules might not have category column populated yet
         if 'category' not in df_up.columns: df_up['category'] = "-"
         st.dataframe(df_up[['next_run_date', 'description', 'category', 'amount', 'frequency', 'Manual?', 'id']], hide_index=True)
         
@@ -386,6 +391,7 @@ with tab5:
     with st.expander("📂 Manage Categories", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
+            st.write("**Add Category**")
             new_cat = st.text_input("Name", key="new_cat_name")
             new_cat_type = st.selectbox("Type", ["Expense", "Income"], key="new_cat_type")
             if st.button("Add"):
@@ -393,6 +399,7 @@ with tab5:
                 st.success(f"Added {new_cat}")
                 st.rerun()
         with c2:
+            st.write("**Delete Category**")
             all_cats = get_categories()
             if all_cats:
                 del_cat = st.selectbox("Select to Delete", all_cats)
@@ -406,7 +413,15 @@ with tab5:
         with st.form("create_acc"):
             new_name = st.text_input("Name")
             new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
-            initial_bal = st.number_input("Starting Balance (Negative for Loan)", value=0.0)
+            
+            # DYNAMIC LABEL FOR BALANCE
+            bal_label = "Starting Balance"
+            if new_type == "Sinking Fund":
+                bal_label = "Existing Saved Amount (Import from Excel)"
+            elif new_type == "Loan":
+                bal_label = "Current Loan Amount (Negative Value)"
+                
+            initial_bal = st.number_input(bal_label, value=0.0)
             
             st.write("--- Goal Settings (Sinking Funds Only) ---")
             new_goal = st.number_input("Goal Amount", value=0.0)
@@ -431,7 +446,6 @@ with tab5:
         row = df_accounts[df_accounts['name'] == edit_acc].iloc[0]
         
         with st.form("edit_settings"):
-            # EDIT NAME FEATURE ADDED HERE
             c_name, c_sort = st.columns([3, 1])
             upd_name = c_name.text_input("Account Name", value=row['name'])
             upd_sort = c_sort.number_input("Sort Order", value=int(row.get('sort_order', 99)), step=1)
