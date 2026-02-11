@@ -1,5 +1,5 @@
 import streamlit as st
-import hmac # <--- THIS WAS MISSING
+import hmac
 from supabase import create_client, Client
 import pandas as pd
 from datetime import datetime, date
@@ -11,10 +11,9 @@ st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 def check_password():
     """Returns `True` if the user had the correct password."""
     def password_entered():
-        """Checks whether a password entered by the user is correct."""
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store the password
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
@@ -26,7 +25,6 @@ def check_password():
         st.error("😕 Password incorrect")
     return False
 
-# STOP APP IF PASSWORD WRONG
 if not check_password():
     st.stop()
 
@@ -86,15 +84,17 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
         update_balance(to_acc_id, amount)
 
 def run_scheduled_transactions():
-    """Auto-run due transactions"""
+    """Auto-run due transactions (ONLY if is_manual is False)"""
     today = datetime.today().date()
-    tasks = supabase.table('schedule').select("*").lte('next_run_date', str(today)).execute().data
+    # Fetch tasks due today or earlier that are AUTO (is_manual is false or null)
+    tasks = supabase.table('schedule').select("*").lte('next_run_date', str(today)).eq('is_manual', False).execute().data
     count = 0
     if tasks:
         for task in tasks:
             add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
                           task['type'], task['from_account_id'], task['to_account_id'], "Recurring")
             
+            # Reschedule or Delete
             if task['frequency'] == 'Monthly':
                 next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
                 supabase.table('schedule').update({"next_run_date": str(next_date)}).eq("id", task['id']).execute()
@@ -103,23 +103,62 @@ def run_scheduled_transactions():
             count += 1
     return count
 
+def get_due_manual_tasks():
+    """Fetch manual reminders that are due"""
+    today = datetime.today().date()
+    return supabase.table('schedule').select("*").lte('next_run_date', str(today)).eq('is_manual', True).execute().data
+
 # --- 3. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
 
-# Auto-Run Scheduler
+# 1. Run Auto-Bot
 processed = run_scheduled_transactions()
-if processed: st.toast(f"Processed {processed} scheduled items!", icon="🤖")
+if processed: st.toast(f"Processed {processed} auto-payments!", icon="🤖")
+
+# 2. Check Manual Reminders
+manual_due = get_due_manual_tasks()
+if manual_due:
+    st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
 
 df_accounts = get_accounts()
 account_map = dict(zip(df_accounts['name'], df_accounts['id']))
 account_list = df_accounts['name'].tolist()
+
+# Filter lists for specific logic
+# Loan accounts should not be sources for expenses
+non_loan_accounts = df_accounts[df_accounts['type'] != 'Loan']['name'].tolist()
 
 # TABS
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
+    # --- MANUAL TASKS SECTION (New!) ---
+    if manual_due:
+        st.write("### 🔔 Pending Manual Transfers")
+        for task in manual_due:
+            with st.expander(f"Due: {task['next_run_date']} - {task['description']} (${task['amount']})", expanded=True):
+                st.write(f"**Action:** {task['type']} of ${task['amount']}")
+                if st.button("✅ I have done this transfer", key=f"done_{task['id']}"):
+                    # 1. Record the transaction
+                    add_transaction(date.today(), task['amount'], f"✅ {task['description']}", 
+                                  task['type'], task['from_account_id'], task['to_account_id'], "Recurring")
+                    
+                    # 2. Update Schedule
+                    if task['frequency'] == 'Monthly':
+                        next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
+                        supabase.table('schedule').update({"next_run_date": str(next_date)}).eq("id", task['id']).execute()
+                    else:
+                        supabase.table('schedule').delete().eq("id", task['id']).execute()
+                    
+                    st.success("recorded and rescheduled!")
+                    st.rerun()
+        st.divider()
+
     st.subheader("Current Finance Stand")
+    
+    # Logic: Loans are liabilities (usually negative balance). Investments are Assets.
+    # Net Worth = Assets (Bank + Cash + Investment) - Debts (Credit Card + Loan + Custodial)
     
     nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
     net_worth = nw_accounts['balance'].sum()
@@ -128,7 +167,7 @@ with tab1:
     total_liquid = asset_accounts['balance'].sum()
     
     c1, c2 = st.columns(2)
-    c1.metric("Net Worth (Configured)", f"${net_worth:,.2f}") 
+    c1.metric("Net Worth", f"${net_worth:,.2f}") 
     c2.metric("Liquid Bank Assets", f"${total_liquid:,.2f}")
 
     st.divider()
@@ -200,7 +239,8 @@ with tab2:
             st.write("--- Sources ---")
             col_bank, col_cash = st.columns(2)
             with col_bank:
-                bank_source = st.selectbox("Bank Source", df_accounts[df_accounts['type']=='Bank']['name'])
+                # Can only pay from Non-Loan accounts
+                bank_source = st.selectbox("Bank Source", df_accounts[df_accounts['type'].isin(['Bank', 'Cash'])]['name'])
                 bank_amount = st.number_input("Amount from Bank", min_value=0.0, format="%.2f")
             with col_cash:
                 cash_source_name = st.selectbox("Cash Source", ["Physical Wallet (Untracked)"] + account_list)
@@ -234,12 +274,15 @@ with tab2:
             
             f_acc, t_acc = None, None
             
-            if t_type == "Expense": f_acc = st.selectbox("Paid From", account_list)
-            elif t_type in ["Income", "Refund"]: t_acc = st.selectbox("Deposit To", account_list)
+            if t_type == "Expense": 
+                # PREVENT LOANS FROM BEING SOURCE OF EXPENSE
+                f_acc = st.selectbox("Paid From", non_loan_accounts)
+            elif t_type in ["Income", "Refund"]: 
+                t_acc = st.selectbox("Deposit To", account_list)
             elif t_type == "Transfer":
                 c_a, c_b = st.columns(2)
-                f_acc = c_a.selectbox("From", account_list)
-                t_acc = c_b.selectbox("To", account_list)
+                f_acc = c_a.selectbox("From", non_loan_accounts) # Cant transfer FROM loan
+                t_acc = c_b.selectbox("To", account_list) # Can transfer TO loan (repayment)
             elif t_type == "Custodial In":
                 c_a, c_b = st.columns(2)
                 f_acc = c_a.selectbox("Custodial Source", df_accounts[df_accounts['type']=='Custodial']['name'])
@@ -285,21 +328,24 @@ with tab4:
     
     with st.expander("➕ Add New Schedule", expanded=True):
         with st.form("sch_form"):
-            s_desc = st.text_input("Description (e.g. Netflix, Rent)")
+            s_desc = st.text_input("Description (e.g. Rent, Investment)")
             c1, c2, c3 = st.columns(3)
             s_amount = c1.number_input("Amount", min_value=0.01)
             s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
             s_date = c3.date_input("Start Date", datetime.today())
             
+            # MANUAL CHECKBOX
+            s_manual = st.checkbox("🔔 Manual Reminder? (Tick this if you do the transfer manually, e.g. PayNow)", value=False)
+            
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
             s_from, s_to = None, None
             if s_type == "Expense":
-                s_from = st.selectbox("From Account", account_list)
+                s_from = st.selectbox("From Account", non_loan_accounts)
             elif s_type == "Income":
                 s_to = st.selectbox("To Account", account_list)
             elif s_type == "Transfer":
-                s_from = st.selectbox("From", account_list, key="s_f")
+                s_from = st.selectbox("From", non_loan_accounts, key="s_f")
                 s_to = st.selectbox("To", account_list, key="s_t")
                 
             if st.form_submit_button("Schedule It"):
@@ -308,7 +354,8 @@ with tab4:
                 supabase.table('schedule').insert({
                     "description": s_desc, "amount": s_amount, "type": s_type, 
                     "from_account_id": f_id, "to_account_id": t_id, 
-                    "frequency": s_freq, "next_run_date": str(s_date)
+                    "frequency": s_freq, "next_run_date": str(s_date),
+                    "is_manual": s_manual
                 }).execute()
                 st.success("Scheduled!")
                 st.rerun()
@@ -317,7 +364,11 @@ with tab4:
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
-        st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount', 'frequency', 'id']])
+        # Format for display
+        df_up = pd.DataFrame(upcoming)
+        df_up['Manual?'] = df_up['is_manual'].apply(lambda x: "🔔 Manual" if x else "🤖 Auto")
+        st.dataframe(df_up[['next_run_date', 'description', 'amount', 'frequency', 'Manual?', 'id']], hide_index=True)
+        
         del_sch_id = st.number_input("Schedule ID to Delete", min_value=0)
         if st.button("Delete Schedule Item"):
             supabase.table('schedule').delete().eq("id", del_sch_id).execute()
@@ -353,8 +404,9 @@ with tab5:
     with st.expander("➕ Add New Account", expanded=False):
         with st.form("create_acc"):
             new_name = st.text_input("Name")
-            new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash"])
-            initial_bal = st.number_input("Starting Balance", value=0.0)
+            # UPDATED TYPES LIST
+            new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
+            initial_bal = st.number_input("Starting Balance (Negative for Loan)", value=0.0)
             
             st.write("--- Goal Settings (Sinking Funds Only) ---")
             new_goal = st.number_input("Goal Amount", value=0.0)
@@ -363,7 +415,7 @@ with tab5:
             if st.form_submit_button("Create Account"):
                 data = {
                     "name": new_name, "type": new_type, "balance": initial_bal,
-                    "include_net_worth": True, "is_liquid_asset": True,
+                    "include_net_worth": True, "is_liquid_asset": True if new_type in ['Bank', 'Cash', 'Investment'] else False,
                     "goal_amount": new_goal if new_type == "Sinking Fund" else 0,
                     "goal_date": str(new_date) if new_type == "Sinking Fund" else None
                 }
