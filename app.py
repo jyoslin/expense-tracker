@@ -5,6 +5,7 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 
 # --- 1. SETUP ---
+# Connect to Supabase
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
@@ -52,8 +53,30 @@ def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date):
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
 
+def run_scheduled_transactions():
+    """Auto-run due transactions"""
+    today = datetime.today().date()
+    tasks = supabase.table('schedule').select("*").lte('next_run_date', str(today)).execute().data
+    count = 0
+    if tasks:
+        for task in tasks:
+            add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
+                          task['type'], task['from_account_id'], task['to_account_id'])
+            
+            if task['frequency'] == 'Monthly':
+                next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
+                supabase.table('schedule').update({"next_run_date": str(next_date)}).eq("id", task['id']).execute()
+            else:
+                supabase.table('schedule').delete().eq("id", task['id']).execute()
+            count += 1
+    return count
+
 # --- 3. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
+
+# Auto-Run Scheduler
+processed = run_scheduled_transactions()
+if processed: st.toast(f"Processed {processed} scheduled items!", icon="🤖")
 
 df_accounts = get_accounts()
 account_map = dict(zip(df_accounts['name'], df_accounts['id']))
@@ -114,7 +137,6 @@ with tab1:
                             update_balance(tx['from_account_id'], tx['amount'])
                             update_balance(tx['to_account_id'], -tx['amount'])
                         elif tx['type'] == "Custodial Out":
-                            # Complex reverse, but basically add back to bank, remove from liability
                             if tx['from_account_id']: update_balance(tx['from_account_id'], tx['amount'])
                             update_balance(tx['to_account_id'], -tx['amount'])
                             
@@ -154,13 +176,12 @@ with tab2:
                     add_transaction(date, bank_amount, f"{desc} (Bank)", "Transfer", account_map[bank_source], account_map[cust_acc])
                 if cash_amount > 0:
                     cash_id = account_map.get(cash_source_name)
-                    # Manual insert for cash part
                     supabase.table('transactions').insert({
                         "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
                         "from_account_id": cash_id, "to_account_id": account_map[cust_acc]
                     }).execute()
-                    update_balance(account_map[cust_acc], cash_amount) # Reduce Liability
-                    if cash_id: update_balance(cash_id, -cash_amount) # Reduce Cash
+                    update_balance(account_map[cust_acc], cash_amount) 
+                    if cash_id: update_balance(cash_id, -cash_amount)
                 st.success("Saved!")
                 st.rerun()
 
@@ -214,14 +235,56 @@ with tab3:
                     if months_left > 0:
                         st.info(f"💡 Save **${shortfall / months_left:,.2f} / month**")
 
-# --- TAB 4: SCHEDULE ---
+# --- TAB 4: SCHEDULE (RESTORED!) ---
 with tab4:
     st.subheader("Manage Future Payments")
-    # (Simplified for brevity - logic remains same as previous versions)
-    # Check if there is data
+    
+    # 1. ADD NEW SCHEDULE
+    with st.expander("➕ Add New Schedule", expanded=True):
+        with st.form("sch_form"):
+            s_desc = st.text_input("Description (e.g. Netflix, Rent)")
+            c1, c2, c3 = st.columns(3)
+            s_amount = c1.number_input("Amount", min_value=0.01)
+            s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
+            s_date = c3.date_input("Start Date", datetime.today())
+            
+            s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
+            
+            s_from, s_to = None, None
+            if s_type == "Expense":
+                s_from = st.selectbox("From Account", account_list)
+            elif s_type == "Income":
+                s_to = st.selectbox("To Account", account_list)
+            elif s_type == "Transfer":
+                s_from = st.selectbox("From", account_list, key="s_f")
+                s_to = st.selectbox("To", account_list, key="s_t")
+                
+            if st.form_submit_button("Schedule It"):
+                f_id = account_map.get(s_from)
+                t_id = account_map.get(s_to)
+                supabase.table('schedule').insert({
+                    "description": s_desc, "amount": s_amount, "type": s_type, 
+                    "from_account_id": f_id, "to_account_id": t_id, 
+                    "frequency": s_freq, "next_run_date": str(s_date)
+                }).execute()
+                st.success("Scheduled!")
+                st.rerun()
+
+    st.divider()
+    
+    # 2. VIEW EXISTING SCHEDULE
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
-        st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount', 'frequency']])
+        st.write("### 🗓️ Upcoming Items")
+        st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount', 'frequency', 'id']])
+        
+        # Delete Function
+        del_sch_id = st.number_input("Schedule ID to Delete", min_value=0)
+        if st.button("Delete Schedule Item"):
+            supabase.table('schedule').delete().eq("id", del_sch_id).execute()
+            st.rerun()
+    else:
+        st.info("No upcoming payments scheduled.")
 
 # --- TAB 5: SETTINGS ---
 with tab5:
@@ -234,9 +297,6 @@ with tab5:
             new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash"])
             initial_bal = st.number_input("Starting Balance", value=0.0)
             
-            # CONDITIONAL: Only show goal if Sinking Fund
-            # Note: In a form, we can't be truly dynamic without rerunning.
-            # So we just show the inputs but label them "Optional (For Sinking Funds)"
             st.write("--- Goal Settings (Sinking Funds Only) ---")
             new_goal = st.number_input("Goal Amount", value=0.0)
             new_date = st.date_input("Goal Deadline", value=None)
@@ -264,7 +324,6 @@ with tab5:
             inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
             is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
             
-            # CONDITIONAL: Only show goal inputs if the account is ALREADY a Sinking Fund
             g_amt = 0.0
             g_date = None
             
