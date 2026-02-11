@@ -5,7 +5,6 @@ from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 
 # --- 1. SETUP ---
-# Connect to Supabase
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
@@ -16,32 +15,24 @@ st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 def get_accounts():
     """Fetch accounts"""
     accounts = supabase.table('accounts').select("*").execute().data
-    df_acc = pd.DataFrame(accounts)
-    if df_acc.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date'])
-    return df_acc.sort_values(by=['name'])
+    df = pd.DataFrame(accounts)
+    if df.empty: return pd.DataFrame(columns=['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date'])
+    return df.sort_values(by=['name'])
+
+def get_categories(type_filter=None):
+    """Fetch categories"""
+    query = supabase.table('categories').select("*")
+    if type_filter:
+        query = query.eq('type', type_filter)
+    data = query.execute().data
+    if not data: return []
+    return sorted([item['name'] for item in data])
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
-
-def add_transaction(date, amount, description, type, from_acc_id, to_acc_id):
-    # Record
-    supabase.table('transactions').insert({
-        "date": str(date), "amount": amount, "description": description, "type": type,
-        "from_account_id": from_acc_id, "to_account_id": to_acc_id
-    }).execute()
-
-    # Update Balances
-    if type == "Expense": update_balance(from_acc_id, -amount)
-    elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
-    elif type == "Transfer":
-        update_balance(from_acc_id, -amount)
-        update_balance(to_acc_id, amount)
-    elif type == "Custodial In": 
-        update_balance(from_acc_id, -amount) 
-        update_balance(to_acc_id, amount)
 
 def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date):
     """Save account preferences"""
@@ -53,6 +44,24 @@ def update_account_settings(id, include_nw, is_asset, goal_amt, goal_date):
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
 
+def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category):
+    # Record
+    supabase.table('transactions').insert({
+        "date": str(date), "amount": amount, "description": description, "type": type,
+        "from_account_id": from_acc_id, "to_account_id": to_acc_id, "category": category
+    }).execute()
+
+    # Update Balances
+    if type == "Expense": update_balance(from_acc_id, -amount)
+    elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
+    elif type in ["Transfer", "Custodial In"]:
+        update_balance(from_acc_id, -amount)
+        update_balance(to_acc_id, amount)
+    elif type == "Custodial Out":
+        # Logic: Bank goes down, Liability goes UP (closer to 0/less negative)
+        if from_acc_id: update_balance(from_acc_id, -amount) 
+        update_balance(to_acc_id, amount)
+
 def run_scheduled_transactions():
     """Auto-run due transactions"""
     today = datetime.today().date()
@@ -60,8 +69,9 @@ def run_scheduled_transactions():
     count = 0
     if tasks:
         for task in tasks:
+            # Default category for auto-runs is 'Recurring' or 'Bills'
             add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
-                          task['type'], task['from_account_id'], task['to_account_id'])
+                          task['type'], task['from_account_id'], task['to_account_id'], "Bills")
             
             if task['frequency'] == 'Monthly':
                 next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
@@ -85,11 +95,11 @@ account_list = df_accounts['name'].tolist()
 # TABS
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
-# --- TAB 1: OVERVIEW (With History) ---
+# --- TAB 1: OVERVIEW ---
 with tab1:
     st.subheader("Current Finance Stand")
     
-    # FILTER DATA BASED ON SETTINGS
+    # 1. METRICS
     nw_accounts = df_accounts[df_accounts['include_net_worth'] == True]
     net_worth = nw_accounts['balance'].sum()
     
@@ -101,28 +111,38 @@ with tab1:
     c2.metric("Liquid Bank Assets", f"${total_liquid:,.2f}")
 
     st.divider()
-    st.write("### Account Breakdown")
-    # Show status icons
-    df_display = df_accounts.copy()
-    df_display['Net Worth?'] = df_display['include_net_worth'].apply(lambda x: "✅" if x else "❌")
-    st.dataframe(df_display[['name', 'balance', 'type', 'Net Worth?']], hide_index=True, use_container_width=True)
-
-    # --- THE RESTORED DETAIL VIEW ---
-    st.divider()
-    st.subheader("🔍 Account Details & History")
     
-    selected_acc_name = st.selectbox("Select Account to View History", account_list)
+    # 2. CATEGORY CHART
+    st.subheader("📊 Spending by Category (Last 30 Days)")
+    # Fetch recent expenses
+    expenses = supabase.table('transactions').select("*").eq('type', 'Expense').order('date', desc=True).limit(50).execute().data
+    if expenses:
+        df_exp = pd.DataFrame(expenses)
+        if 'category' in df_exp.columns and not df_exp.empty:
+            cat_sum = df_exp.groupby('category')['amount'].sum().reset_index().sort_values('amount', ascending=False)
+            
+            col_chart, col_data = st.columns([2, 1])
+            with col_chart:
+                st.bar_chart(cat_sum.set_index('category'))
+            with col_data:
+                st.dataframe(cat_sum, hide_index=True, use_container_width=True)
+    else:
+        st.info("No recent expenses to show.")
+
+    st.divider()
+    
+    # 3. ACCOUNT HISTORY
+    st.subheader("🔍 Account Details & History")
+    selected_acc_name = st.selectbox("Select Account", account_list)
     
     if selected_acc_name:
         selected_acc_id = account_map[selected_acc_name]
-        
-        # Fetch History
         history = supabase.table('transactions').select("*") \
             .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
             .order('date', desc=True).limit(50).execute().data
             
         if history:
-            st.dataframe(pd.DataFrame(history)[['date', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
             
             with st.expander("🗑️ Delete Transaction"):
                 del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
@@ -143,8 +163,6 @@ with tab1:
                         supabase.table('transactions').delete().eq('id', del_id).execute()
                         st.success("Deleted!")
                         st.rerun()
-        else:
-            st.info("No transactions found.")
 
 # --- TAB 2: ENTRY ---
 with tab2:
@@ -170,24 +188,33 @@ with tab2:
                 cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
             
             desc = st.text_input("Description")
+            category = "Custodial" # Default category
             
             if st.form_submit_button("Process Split Payment"):
                 if bank_amount > 0:
-                    add_transaction(date, bank_amount, f"{desc} (Bank)", "Transfer", account_map[bank_source], account_map[cust_acc])
+                    add_transaction(date, bank_amount, f"{desc} (Bank)", "Custodial Out", account_map[bank_source], account_map[cust_acc], category)
                 if cash_amount > 0:
                     cash_id = account_map.get(cash_source_name)
-                    supabase.table('transactions').insert({
-                        "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
-                        "from_account_id": cash_id, "to_account_id": account_map[cust_acc]
-                    }).execute()
-                    update_balance(account_map[cust_acc], cash_amount) 
-                    if cash_id: update_balance(cash_id, -cash_amount)
+                    # If untracked cash, manually insert to avoid 'from' update error, but update 'to'
+                    if not cash_id:
+                        supabase.table('transactions').insert({
+                            "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
+                            "to_account_id": account_map[cust_acc], "category": category
+                        }).execute()
+                        update_balance(account_map[cust_acc], cash_amount)
+                    else:
+                        add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category)
                 st.success("Saved!")
                 st.rerun()
 
         # --- STANDARD TRANSACTIONS ---
         else:
             amt = c2.number_input("Amount", min_value=0.01)
+            
+            # CATEGORY SELECTOR
+            cat_options = get_categories("Income") if t_type == "Income" else get_categories("Expense")
+            category = st.selectbox("Category", cat_options)
+            
             f_acc, t_acc = None, None
             
             if t_type == "Expense": f_acc = st.selectbox("Paid From", account_list)
@@ -204,7 +231,7 @@ with tab2:
             desc = st.text_input("Description")
             
             if st.form_submit_button("Submit"):
-                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc))
+                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category)
                 st.success("Saved!")
                 st.rerun()
 
@@ -235,11 +262,10 @@ with tab3:
                     if months_left > 0:
                         st.info(f"💡 Save **${shortfall / months_left:,.2f} / month**")
 
-# --- TAB 4: SCHEDULE (RESTORED!) ---
+# --- TAB 4: SCHEDULE ---
 with tab4:
     st.subheader("Manage Future Payments")
     
-    # 1. ADD NEW SCHEDULE
     with st.expander("➕ Add New Schedule", expanded=True):
         with st.form("sch_form"):
             s_desc = st.text_input("Description (e.g. Netflix, Rent)")
@@ -271,26 +297,42 @@ with tab4:
                 st.rerun()
 
     st.divider()
-    
-    # 2. VIEW EXISTING SCHEDULE
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
         st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount', 'frequency', 'id']])
-        
-        # Delete Function
         del_sch_id = st.number_input("Schedule ID to Delete", min_value=0)
         if st.button("Delete Schedule Item"):
             supabase.table('schedule').delete().eq("id", del_sch_id).execute()
             st.rerun()
-    else:
-        st.info("No upcoming payments scheduled.")
 
 # --- TAB 5: SETTINGS ---
 with tab5:
-    st.subheader("🔧 Account Configuration")
+    st.subheader("🔧 Configuration")
     
-    # 1. CREATE ACCOUNT (Restored!)
+    # 1. MANAGE CATEGORIES
+    with st.expander("📂 Manage Categories", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Add Category**")
+            new_cat = st.text_input("Name", key="new_cat_name")
+            new_cat_type = st.selectbox("Type", ["Expense", "Income"], key="new_cat_type")
+            if st.button("Add"):
+                supabase.table('categories').insert({"name": new_cat, "type": new_cat_type}).execute()
+                st.success(f"Added {new_cat}")
+                st.rerun()
+        with c2:
+            st.write("**Delete Category**")
+            all_cats = get_categories()
+            if all_cats:
+                del_cat = st.selectbox("Select to Delete", all_cats)
+                if st.button("Delete"):
+                    supabase.table('categories').delete().eq("name", del_cat).execute()
+                    st.rerun()
+
+    st.divider()
+
+    # 2. CREATE ACCOUNT
     with st.expander("➕ Add New Account", expanded=False):
         with st.form("create_acc"):
             new_name = st.text_input("Name")
@@ -314,7 +356,7 @@ with tab5:
 
     st.divider()
     
-    # 2. EDIT ACCOUNT
+    # 3. EDIT ACCOUNT
     edit_acc = st.selectbox("Edit Existing Account", account_list)
     if edit_acc:
         row = df_accounts[df_accounts['name'] == edit_acc].iloc[0]
@@ -326,7 +368,6 @@ with tab5:
             
             g_amt = 0.0
             g_date = None
-            
             if row['type'] == 'Sinking Fund':
                 st.divider()
                 st.write("Goal Settings")
