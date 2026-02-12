@@ -33,16 +33,22 @@ url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-# --- 2. HELPER FUNCTIONS ---
+# --- 2. CACHED HELPER FUNCTIONS (SPEED BOOSTERS) ---
+
+def clear_cache():
+    """Clears the cache to force a reload of data"""
+    st.cache_data.clear()
+
+@st.cache_data(ttl=300) # Cache this for 5 minutes or until cleared
 def get_accounts(show_inactive=False):
-    """Fetch accounts sorted by Custom Sort Order, then Name"""
+    """Fetch accounts sorted by Custom Sort Order"""
+    # Performance: This only hits the DB once, then remembers the result
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
     cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark']
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # Ensure columns exist
     if 'sort_order' not in df.columns: df['sort_order'] = 99
     if 'is_active' not in df.columns: df['is_active'] = True
     if 'remark' not in df.columns: df['remark'] = ""
@@ -52,6 +58,7 @@ def get_accounts(show_inactive=False):
         
     return df.sort_values(by=['sort_order', 'name'])
 
+@st.cache_data(ttl=3600) # Categories rarely change, cache for 1 hour
 def get_categories(type_filter=None):
     """Fetch categories"""
     query = supabase.table('categories').select("*")
@@ -63,12 +70,13 @@ def get_categories(type_filter=None):
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
+    # Note: We don't cache this because we need real-time reading for math
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
 def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active, remark):
-    """Save account preferences including Remark"""
+    """Save account preferences"""
     data = {
         "name": name,
         "balance": balance,
@@ -81,6 +89,7 @@ def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, g
         "remark": remark
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
+    clear_cache() # Force reload of account list
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
     # Record
@@ -99,6 +108,8 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
     elif type == "Custodial Out":
         if from_acc_id: update_balance(from_acc_id, -amount) 
         update_balance(to_acc_id, amount)
+    
+    clear_cache() # Force reload so balances update on screen
 
 def run_scheduled_transactions():
     """Auto-run due transactions"""
@@ -126,17 +137,22 @@ def get_due_manual_tasks():
 # --- 3. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
 
-processed = run_scheduled_transactions()
-if processed: st.toast(f"Processed {processed} auto-payments!", icon="🤖")
+# SPEED OPTIMIZATION: Only run the scheduler once per session state
+if 'scheduler_run' not in st.session_state:
+    processed = run_scheduled_transactions()
+    if processed: st.toast(f"Processed {processed} auto-payments!", icon="🤖")
+    st.session_state['scheduler_run'] = True
 
-manual_due = get_due_manual_tasks()
-if manual_due:
-    st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
-
+# FETCH CACHED DATA
 df_active = get_accounts(show_inactive=False)
 account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
+
+# Manual Tasks Check (Lightweight)
+manual_due = get_due_manual_tasks()
+if manual_due:
+    st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
@@ -173,18 +189,17 @@ with tab1:
 
     st.divider()
     
-    # ACCOUNT BREAKDOWN WITH REMARKS
     with st.expander("📂 View Account Breakdown & Notes"):
         st.dataframe(df_active[['name', 'balance', 'type', 'remark']], hide_index=True, use_container_width=True)
 
     st.divider()
     
-    # CATEGORY CHART
     st.subheader("📊 Spending by Category")
     col_d1, col_d2 = st.columns(2)
     start_date = col_d1.date_input("Start Date", date.today().replace(day=1)) 
     end_date = col_d2.date_input("End Date", date.today())
     
+    # We don't cache this query because dates change often
     expenses = supabase.table('transactions').select("*") \
         .eq('type', 'Expense') \
         .gte('date', str(start_date)) \
@@ -204,24 +219,22 @@ with tab1:
             sel_cat_view = st.selectbox("Select Category to View Details", cat_sum['category'].tolist())
             if sel_cat_view:
                 df_detail = df_exp[df_exp['category'] == sel_cat_view]
-                # Added 'remark' to the drill down view
                 st.dataframe(df_detail[['date', 'description', 'remark', 'amount']], hide_index=True, use_container_width=True)
     else:
         st.info("No expenses found in this date range.")
 
     st.divider()
     
-    # ACCOUNT HISTORY
     st.subheader("🔍 Account Details & History")
     selected_acc_name = st.selectbox("Select Account", account_list)
     if selected_acc_name:
         selected_acc_id = account_map[selected_acc_name]
+        # Limit history fetch to 50 items to keep it fast
         history = supabase.table('transactions').select("*") \
             .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
             .order('date', desc=True).limit(50).execute().data
             
         if history:
-            # Added 'remark' to history table
             st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'remark', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
             with st.expander("🗑️ Delete Transaction"):
                 del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
@@ -238,6 +251,7 @@ with tab1:
                             if tx['from_account_id']: update_balance(tx['from_account_id'], tx['amount'])
                             update_balance(tx['to_account_id'], -tx['amount'])
                         supabase.table('transactions').delete().eq('id', del_id).execute()
+                        clear_cache() # Clear cache on delete
                         st.success("Deleted!")
                         st.rerun()
 
@@ -249,8 +263,6 @@ with tab2:
     with st.form("entry"):
         c1, c2 = st.columns(2)
         date = c1.date_input("Date", datetime.today())
-        
-        # --- NEW: REMARK FIELD ---
         
         if t_type == "Custodial Out":
             st.info("Paying back custodial money (Split Payment)")
@@ -266,7 +278,7 @@ with tab2:
                 cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
             
             desc = st.text_input("Description (Short)")
-            remark = st.text_area("Remark / Notes (Optional)", height=68) # NEW FIELD
+            remark = st.text_area("Remark / Notes (Optional)", height=68)
             category = "Custodial" 
             
             if st.form_submit_button("Process Split Payment"):
@@ -280,6 +292,7 @@ with tab2:
                             "to_account_id": account_map[cust_acc], "category": category, "remark": remark
                         }).execute()
                         update_balance(account_map[cust_acc], cash_amount)
+                        clear_cache()
                     else:
                         add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category, remark)
                 st.success("Saved!")
@@ -303,7 +316,7 @@ with tab2:
                 t_acc = c_b.selectbox("Bank Received", df_active[df_active['type']=='Bank']['name'])
 
             desc = st.text_input("Description (Short)")
-            remark = st.text_area("Remark / Notes (Optional)", height=68) # NEW FIELD
+            remark = st.text_area("Remark / Notes (Optional)", height=68)
             
             if st.form_submit_button("Submit"):
                 add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category, remark)
@@ -417,6 +430,7 @@ with tab5:
             new_cat_type = st.selectbox("Type", ["Expense", "Income"], key="new_cat_type")
             if st.button("Add"):
                 supabase.table('categories').insert({"name": new_cat, "type": new_cat_type}).execute()
+                clear_cache() # Clear cache so entry form updates
                 st.success(f"Added {new_cat}")
                 st.rerun()
         with c2:
@@ -426,6 +440,7 @@ with tab5:
                 del_cat = st.selectbox("Select to Delete", all_cats)
                 if st.button("Delete"):
                     supabase.table('categories').delete().eq("name", del_cat).execute()
+                    clear_cache()
                     st.rerun()
 
     st.divider()
@@ -440,8 +455,6 @@ with tab5:
             elif new_type == "Loan": bal_label = "Current Loan Amount (Negative Value)"
             
             initial_bal = st.number_input(bal_label, value=0.0)
-            
-            # REMARK FIELD FOR ACCOUNT
             new_remark = st.text_area("Account Notes (e.g., Min balance, Interest rate)", height=68)
             
             st.write("--- Goal Settings (Sinking Funds Only) ---")
@@ -459,6 +472,7 @@ with tab5:
                     "remark": new_remark
                 }
                 supabase.table('accounts').insert(data).execute()
+                clear_cache()
                 st.success(f"Created {new_name}!")
                 st.rerun()
 
@@ -480,8 +494,6 @@ with tab5:
             upd_sort = c_sort.number_input("Sort Order", value=int(row.get('sort_order', 99)), step=1)
             
             upd_bal = st.number_input("Current Balance (Manual Adjustment)", value=float(row['balance']))
-            
-            # REMARK EDITING
             upd_remark = st.text_area("Account Notes", value=row.get('remark', ''))
 
             c1, c2, c3 = st.columns(3)
