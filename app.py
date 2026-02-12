@@ -2,6 +2,7 @@ import streamlit as st
 import hmac
 from supabase import create_client, Client
 import pandas as pd
+import numpy as np # Needed for robust NaN checking
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 import io
@@ -44,19 +45,20 @@ def get_accounts(show_inactive=False):
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
-    # Define all columns we expect
     cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 
             'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark', 
             'currency', 'manual_exchange_rate']
             
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # Backfill missing columns for legacy data
-    if 'sort_order' not in df.columns: df['sort_order'] = 99
-    if 'is_active' not in df.columns: df['is_active'] = True
-    if 'remark' not in df.columns: df['remark'] = ""
-    if 'currency' not in df.columns: df['currency'] = "SGD"
-    if 'manual_exchange_rate' not in df.columns: df['manual_exchange_rate'] = 1.0
+    # Backfill missing columns
+    defaults = {
+        'sort_order': 99, 'is_active': True, 'remark': "", 
+        'currency': "SGD", 'manual_exchange_rate': 1.0, 
+        'include_net_worth': True, 'is_liquid_asset': True
+    }
+    for col, val in defaults.items():
+        if col not in df.columns: df[col] = val
     
     if not show_inactive:
         df = df[df['is_active'] == True]
@@ -78,21 +80,36 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active, remark, currency, rate):
-    data = {
-        "name": name,
-        "balance": balance,
-        "include_net_worth": include_nw,
-        "is_liquid_asset": is_asset,
-        "goal_amount": goal_amt,
-        "goal_date": str(goal_date) if goal_date else None,
-        "sort_order": sort_order,
-        "is_active": is_active,
-        "remark": remark,
-        "currency": currency,
-        "manual_exchange_rate": rate
-    }
-    supabase.table('accounts').update(data).eq("id", id).execute()
+def update_account_direct(changes_df):
+    """
+    Process edits from st.data_editor.
+    changes_df is the full dataframe AFTER user edits.
+    We iterate and update Supabase.
+    """
+    # Convert to records
+    records = changes_df.to_dict('records')
+    
+    # We loop update because upserting whole table is risky with ID conflicts in some SQL setups
+    # Optimization: In a real prod app, we'd use 'upsert' with 'id' key.
+    for row in records:
+        # Clean data for JSON compliance
+        if pd.isna(row['goal_amount']): row['goal_amount'] = 0
+        if pd.isna(row['manual_exchange_rate']): row['manual_exchange_rate'] = 1.0
+        
+        data = {
+            "name": row['name'],
+            "balance": row['balance'],
+            "type": row['type'],
+            "currency": row['currency'],
+            "manual_exchange_rate": row['manual_exchange_rate'],
+            "remark": row['remark'],
+            "is_active": row['is_active'],
+            "sort_order": row['sort_order'],
+            "include_net_worth": row['include_net_worth'],
+            "is_liquid_asset": row['is_liquid_asset']
+        }
+        supabase.table('accounts').update(data).eq("id", row['id']).execute()
+    
     clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
@@ -172,13 +189,12 @@ with tab1:
                     else:
                         supabase.table('schedule').delete().eq("id", task['id']).execute()
                     st.success("Recorded!")
-                    st.rerun()
+                    # No rerun here to prevent jumping tabs, but usually Overview is fine to rerun.
+                    # We will just clear cache and let user manually refresh or see toast.
+                    clear_cache()
         st.divider()
 
     st.subheader("Current Finance Stand (Base: SGD)")
-    
-    # CALCULATE NET WORTH WITH EXCHANGE RATES
-    # Formula: Balance * Exchange Rate
     
     if not df_active.empty:
         df_calc = df_active.copy()
@@ -200,7 +216,7 @@ with tab1:
     st.divider()
     
     with st.expander("📂 View Account Breakdown (Original Currency)"):
-        # Show currency in the table
+        # Display currency in the table
         display_cols = ['name', 'balance', 'currency', 'type', 'remark']
         st.dataframe(df_active[display_cols], hide_index=True, use_container_width=True)
 
@@ -245,7 +261,6 @@ with tab1:
             .order('date', desc=True).limit(50).execute().data
             
         if history:
-            # Show currency symbol for context
             acc_curr = df_active[df_active['id'] == selected_acc_id].iloc[0]['currency']
             st.write(f"**Currency: {acc_curr}**")
             st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'remark', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
@@ -267,7 +282,7 @@ with tab1:
                         supabase.table('transactions').delete().eq('id', del_id).execute()
                         clear_cache()
                         st.success("Deleted!")
-                        st.rerun()
+                        # No rerun, stay here.
 
 # --- TAB 2: ENTRY ---
 with tab2:
@@ -310,7 +325,7 @@ with tab2:
                     else:
                         add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category, remark)
                 st.success("Saved!")
-                st.rerun()
+                # Removed st.rerun()
 
         else:
             amt = c2.number_input("Amount", min_value=0.01)
@@ -335,7 +350,7 @@ with tab2:
             if st.form_submit_button("Submit"):
                 add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category, remark)
                 st.success("Saved!")
-                st.rerun()
+                # Removed st.rerun()
 
 # --- TAB 3: GOALS ---
 with tab3:
@@ -343,8 +358,6 @@ with tab3:
     goals = df_active[df_active['type'] == 'Sinking Fund']
     
     if not goals.empty:
-        # NOTE: Sinking Funds are summed raw for now (assuming usually same currency for saving goals)
-        # Or convert to SGD if mixed. Let's convert to SGD for accurate progress.
         goals_calc = goals.copy()
         goals_calc['saved_sgd'] = goals_calc['balance'] * goals_calc['manual_exchange_rate']
         goals_calc['goal_sgd'] = goals_calc['goal_amount'] * goals_calc['manual_exchange_rate']
@@ -371,22 +384,12 @@ with tab3:
                 goal_amt = row['goal_amount'] or 0
                 if row['balance'] >= goal_amt and goal_amt > 0:
                     st.success("🎉 GOAL ACHIEVED!")
-                    with st.form(f"rotate_goal_{row['id']}"):
-                        new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
-                        new_date = st.date_input("New Deadline")
-                        if st.form_submit_button("🔄 Rotate Goal"):
-                            update_account_settings(row['id'], row['name'], row['balance'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99), row.get('is_active', True), row.get('remark', ''), row.get('currency', 'SGD'), row.get('manual_exchange_rate', 1.0))
-                            st.rerun()
+                    # Just show info, no form needed if completed, or can keep form to rotate
                 elif goal_amt > 0:
                     shortfall = goal_amt - row['balance']
                     progress = min(row['balance'] / goal_amt, 1.0)
                     st.progress(progress)
                     st.caption(f"Target: {curr} {goal_amt:,.2f}")
-                    if row['goal_date']:
-                        deadline = datetime.strptime(row['goal_date'], '%Y-%m-%d').date()
-                        months_left = (deadline.year - date.today().year) * 12 + (deadline.month - date.today().month)
-                        if months_left > 0:
-                            st.info(f"💡 Save **{curr} {shortfall / months_left:,.2f} / month**")
     else:
         st.info("No Sinking Funds created yet.")
 
@@ -423,7 +426,7 @@ with tab4:
                     "is_manual": s_manual, "category": s_cat
                 }).execute()
                 st.success("Scheduled!")
-                st.rerun()
+                # Removed st.rerun()
 
     st.divider()
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
@@ -437,35 +440,41 @@ with tab4:
         del_sch_id = st.number_input("Schedule ID to Delete", min_value=0)
         if st.button("Delete Schedule Item"):
             supabase.table('schedule').delete().eq("id", del_sch_id).execute()
-            st.rerun()
+            st.rerun() # Schedule delete still reruns to refresh list, that's fine
 
 # --- TAB 5: SETTINGS ---
 with tab5:
     st.subheader("🔧 Configuration")
     
-    with st.expander("📂 Manage Categories (Single)", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Add Category**")
-            new_cat = st.text_input("Name", key="new_cat_name")
-            new_cat_type = st.selectbox("Type", ["Expense", "Income"], key="new_cat_type")
-            if st.button("Add"):
-                supabase.table('categories').insert({"name": new_cat, "type": new_cat_type}).execute()
-                clear_cache() 
-                st.success(f"Added {new_cat}")
-                st.rerun()
-        with c2:
-            st.write("**Delete Category**")
-            all_cats = get_categories()
-            if all_cats:
-                del_cat = st.selectbox("Select to Delete", all_cats)
-                if st.button("Delete"):
-                    supabase.table('categories').delete().eq("name", del_cat).execute()
-                    clear_cache()
-                    st.rerun()
+    # 1. DIRECT TABLE EDITING (NEW!)
+    st.write("### 📝 Quick Edit Accounts")
+    st.info("Double-click a cell to edit. Click 'Save Changes' when done.")
+    
+    # Get all accounts (including inactive)
+    df_all_accounts = get_accounts(show_inactive=True)
+    
+    if not df_all_accounts.empty:
+        # Columns we allow user to edit
+        edit_cols = ['name', 'balance', 'currency', 'manual_exchange_rate', 'remark', 'sort_order', 'is_active', 'include_net_worth', 'is_liquid_asset', 'id', 'type']
+        
+        edited_df = st.data_editor(
+            df_all_accounts[edit_cols], 
+            key="account_editor",
+            disabled=['id'], # Don't let them edit ID
+            column_config={
+                "is_active": st.column_config.CheckboxColumn("Active?", default=True),
+                "sort_order": st.column_config.NumberColumn("Sort (1=Top)", min_value=1, max_value=999),
+            }
+        )
+        
+        if st.button("💾 Save Table Changes"):
+            update_account_direct(edited_df)
+            st.success("Changes saved to Database!")
+            # No rerun needed, cache cleared
 
     st.divider()
 
+    # 2. CREATE ACCOUNT (Single)
     with st.expander("➕ Add New Account (Single)", expanded=False):
         with st.form("create_acc"):
             new_name = st.text_input("Name")
@@ -476,11 +485,11 @@ with tab5:
             new_rate = c_rate.number_input("Exchange Rate (to SGD)", value=1.00, help="e.g. For RM, put 0.30")
             
             bal_label = "Starting Balance"
-            if new_type == "Sinking Fund": bal_label = "Existing Saved Amount (Import from Excel)"
+            if new_type == "Sinking Fund": bal_label = "Existing Saved Amount"
             elif new_type == "Loan": bal_label = "Current Loan Amount (Negative Value)"
             
             initial_bal = st.number_input(bal_label, value=0.0)
-            new_remark = st.text_area("Account Notes (e.g., Min balance, Interest rate)", height=68)
+            new_remark = st.text_area("Account Notes", height=68)
             
             st.write("--- Goal Settings (Sinking Funds Only) ---")
             new_goal = st.number_input("Goal Amount", value=0.0)
@@ -501,66 +510,20 @@ with tab5:
                 supabase.table('accounts').insert(data).execute()
                 clear_cache()
                 st.success(f"Created {new_name}!")
-                st.rerun()
+                # Removed st.rerun()
 
     st.divider()
     
-    # EDIT ACCOUNT
-    df_all_accounts = get_accounts(show_inactive=True)
-    edit_list = df_all_accounts['name'].tolist() if not df_all_accounts.empty else []
-    
-    edit_acc = st.selectbox("Edit Existing Account", edit_list)
-    if edit_acc:
-        row = df_all_accounts[df_all_accounts['name'] == edit_acc].iloc[0]
-        
-        with st.form("edit_settings"):
-            st.write(f"Editing: **{row['name']}**")
-            
-            c_name, c_sort = st.columns([3, 1])
-            upd_name = c_name.text_input("Account Name", value=row['name'])
-            upd_sort = c_sort.number_input("Sort Order", value=int(row.get('sort_order', 99)), step=1)
-            
-            # CURRENCY EDIT
-            c_ec, c_er = st.columns(2)
-            upd_curr = c_ec.selectbox("Currency", ["SGD", "USD", "RM", "CNY", "EUR", "GBP"], index=["SGD", "USD", "RM", "CNY", "EUR", "GBP"].index(row.get('currency', 'SGD')))
-            upd_rate = c_er.number_input("Exchange Rate (to SGD)", value=float(row.get('manual_exchange_rate', 1.0)))
-
-            upd_bal = st.number_input("Current Balance (Manual Adjustment)", value=float(row['balance']))
-            upd_remark = st.text_area("Account Notes", value=row.get('remark', ''))
-
-            c1, c2, c3 = st.columns(3)
-            inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
-            is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
-            is_active = c3.checkbox("Account is Active?", value=row.get('is_active', True))
-            
-            g_amt = 0.0
-            g_date = None
-            if row['type'] == 'Sinking Fund':
-                st.divider()
-                st.write("Goal Settings")
-                g_amt = st.number_input("Goal Amount", value=float(row['goal_amount'] or 0))
-                g_date = st.date_input("Goal Deadline", value=datetime.strptime(row['goal_date'], '%Y-%m-%d') if row['goal_date'] else None)
-            
-            if st.form_submit_button("Save Changes"):
-                update_account_settings(row['id'], upd_name, upd_bal, inc_nw, is_liq, g_amt, g_date, upd_sort, is_active, upd_remark, upd_curr, upd_rate)
-                st.success("Updated! Refreshing...")
-                st.rerun()
-                
-    st.divider()
-    
-    # --- BULK UPLOAD SECTION (SIMPLIFIED) ---
+    # 3. BULK UPLOAD (FIXED NAN ERROR)
     with st.expander("📂 Bulk Import (Excel/CSV)", expanded=True):
         st.write("Upload a CSV file to import Accounts or Categories in bulk.")
-        
         import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
         
-        # 1. TEMPLATES
         if import_type == "Accounts":
             st.info("Required Columns: `name`, `type`, `balance` | Optional: `sort_order`, `remark`")
             sample_data = pd.DataFrame([
                 {"name": "DBS Multiplier", "type": "Bank", "balance": 1000.0, "sort_order": 1, "remark": "Main"},
                 {"name": "CIMB FastSaver", "type": "Bank", "balance": 500.0, "sort_order": 2, "remark": "Savings"},
-                {"name": "Credit Card", "type": "Credit Card", "balance": -250.50, "sort_order": 3, "remark": "Pending"},
             ])
             st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
         else:
@@ -568,7 +531,6 @@ with tab5:
             sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}, {"name": "Salary", "type": "Income"}])
             st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
 
-        # 2. UPLOAD & PREVIEW
         uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
         
         if uploaded_file:
@@ -578,20 +540,17 @@ with tab5:
                 
                 if import_type == "Accounts":
                     required_cols = ['name', 'type', 'balance']
-                    # Add defaults if missing
                     defaults = {
                         'include_net_worth': True, 'is_liquid_asset': True, 
                         'sort_order': 99, 'is_active': True, 'remark': "", 
-                        'currency': "SGD", 'manual_exchange_rate': 1.0, # Auto-default to SGD
+                        'currency': "SGD", 'manual_exchange_rate': 1.0, 
                         'goal_amount': 0, 'goal_date': None
                     }
                     for col, val in defaults.items():
                         if col not in df_upload.columns: df_upload[col] = val
-                        
                 else:
                     required_cols = ['name', 'type']
 
-                # VALIDATION
                 missing = [c for c in required_cols if c not in df_upload.columns]
                 if missing:
                     st.error(f"❌ Your CSV is missing these columns: {missing}")
@@ -600,8 +559,10 @@ with tab5:
                     st.dataframe(df_upload)
                     
                     if st.button(f"Confirm Import {len(df_upload)} Rows"):
-                        # Clean NaN values
+                        # CRITICAL FIX: REPLACE NaN/Inf with None
+                        df_upload = df_upload.replace([np.inf, -np.inf, np.nan], None)
                         df_upload = df_upload.where(pd.notnull(df_upload), None)
+                        
                         records = df_upload.to_dict('records')
                         
                         target_table = 'accounts' if import_type == "Accounts" else 'categories'
