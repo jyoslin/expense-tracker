@@ -409,51 +409,6 @@ with tab4:
 with tab5:
     st.subheader("🔧 Configuration")
     
-    # --- BULK UPLOAD SECTION ---
-    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=False):
-        st.write("Upload a CSV file to import Accounts or Categories in bulk.")
-        
-        import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
-        
-        # Template Generators
-        if import_type == "Accounts":
-            st.info("Required Columns: `name`, `type`, `balance`, `remark`")
-            # Create sample CSV
-            sample_data = pd.DataFrame([{"name": "DBS", "type": "Bank", "balance": 1000, "remark": "Main"}])
-            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
-        else:
-            st.info("Required Columns: `name`, `type` (Expense/Income)")
-            sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}])
-            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
-
-        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
-        
-        if uploaded_file and st.button("Start Import"):
-            try:
-                df_upload = pd.read_csv(uploaded_file)
-                if import_type == "Accounts":
-                    # Add defaults for missing columns
-                    if 'include_net_worth' not in df_upload.columns: df_upload['include_net_worth'] = True
-                    if 'is_liquid_asset' not in df_upload.columns: df_upload['is_liquid_asset'] = True
-                    if 'sort_order' not in df_upload.columns: df_upload['sort_order'] = 99
-                    if 'is_active' not in df_upload.columns: df_upload['is_active'] = True
-                    
-                    # Convert to list of dicts for Supabase
-                    records = df_upload.to_dict('records')
-                    supabase.table('accounts').insert(records).execute()
-                else:
-                    # Categories
-                    records = df_upload.to_dict('records')
-                    supabase.table('categories').insert(records).execute()
-                    
-                clear_cache()
-                st.success(f"Successfully imported {len(records)} records!")
-            except Exception as e:
-                st.error(f"Error importing: {e}")
-
-    st.divider()
-
-    # MANAGE CATEGORIES (Single)
     with st.expander("📂 Manage Categories (Single)", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -545,3 +500,43 @@ with tab5:
                 update_account_settings(row['id'], upd_name, upd_bal, inc_nw, is_liq, g_amt, g_date, upd_sort, is_active, upd_remark)
                 st.success("Updated! Refreshing...")
                 st.rerun()
+                
+    st.divider()
+    
+    # --- BULK UPLOAD SECTION (MOVED TO BOTTOM) ---
+    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=False):
+        st.write("Upload a CSV file to import Accounts or Categories in bulk.")
+        
+        import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
+        
+        if import_type == "Accounts":
+            st.info("Required Columns: `name`, `type`, `balance`, `remark`")
+            sample_data = pd.DataFrame([{"name": "DBS", "type": "Bank", "balance": 1000, "remark": "Main"}])
+            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
+        else:
+            st.info("Required Columns: `name`, `type` (Expense/Income)")
+            sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}])
+            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
+
+        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+        
+        if uploaded_file and st.button("Start Import"):
+            try:
+                df_upload = pd.read_csv(uploaded_file)
+                if import_type == "Accounts":
+                    if 'include_net_worth' not in df_upload.columns: df_upload['include_net_worth'] = True
+                    if 'is_liquid_asset' not in df_upload.columns: df_upload['is_liquid_asset'] = True
+                    if 'sort_order' not in df_upload.columns: df_upload['sort_order'] = 99
+                    if 'is_active' not in df_upload.columns: df_upload['is_active'] = True
+                    if 'remark' not in df_upload.columns: df_upload['remark'] = ""
+                    
+                    records = df_upload.to_dict('records')
+                    supabase.table('accounts').insert(records).execute()
+                else:
+                    records = df_upload.to_dict('records')
+                    supabase.table('categories').insert(records).execute()
+                    
+                clear_cache()
+                st.success(f"Successfully imported {len(records)} records!")
+            except Exception as e:
+                st.error(f"Error importing: {e}")
