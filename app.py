@@ -4,6 +4,7 @@ from supabase import create_client, Client
 import pandas as pd
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
+import io
 
 # --- 1. SECURITY & SETUP ---
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
@@ -33,16 +34,13 @@ url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
 
-# --- 2. CACHED HELPER FUNCTIONS (SPEED BOOSTERS) ---
+# --- 2. CACHED HELPER FUNCTIONS ---
 
 def clear_cache():
-    """Clears the cache to force a reload of data"""
     st.cache_data.clear()
 
-@st.cache_data(ttl=300) # Cache this for 5 minutes or until cleared
+@st.cache_data(ttl=300)
 def get_accounts(show_inactive=False):
-    """Fetch accounts sorted by Custom Sort Order"""
-    # Performance: This only hits the DB once, then remembers the result
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
@@ -58,9 +56,8 @@ def get_accounts(show_inactive=False):
         
     return df.sort_values(by=['sort_order', 'name'])
 
-@st.cache_data(ttl=3600) # Categories rarely change, cache for 1 hour
+@st.cache_data(ttl=3600)
 def get_categories(type_filter=None):
-    """Fetch categories"""
     query = supabase.table('categories').select("*")
     if type_filter:
         query = query.eq('type', type_filter)
@@ -70,13 +67,11 @@ def get_categories(type_filter=None):
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
-    # Note: We don't cache this because we need real-time reading for math
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
 def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active, remark):
-    """Save account preferences"""
     data = {
         "name": name,
         "balance": balance,
@@ -89,17 +84,15 @@ def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, g
         "remark": remark
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
-    clear_cache() # Force reload of account list
+    clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
-    # Record
     supabase.table('transactions').insert({
         "date": str(date), "amount": amount, "description": description, "type": type,
         "from_account_id": from_acc_id, "to_account_id": to_acc_id, "category": category,
         "remark": remark
     }).execute()
 
-    # Update Balances
     if type == "Expense": update_balance(from_acc_id, -amount)
     elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
     elif type in ["Transfer", "Custodial In"]:
@@ -109,10 +102,9 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
         if from_acc_id: update_balance(from_acc_id, -amount) 
         update_balance(to_acc_id, amount)
     
-    clear_cache() # Force reload so balances update on screen
+    clear_cache()
 
 def run_scheduled_transactions():
-    """Auto-run due transactions"""
     today = datetime.today().date()
     tasks = supabase.table('schedule').select("*").lte('next_run_date', str(today)).eq('is_manual', False).execute().data
     count = 0
@@ -137,19 +129,16 @@ def get_due_manual_tasks():
 # --- 3. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
 
-# SPEED OPTIMIZATION: Only run the scheduler once per session state
 if 'scheduler_run' not in st.session_state:
     processed = run_scheduled_transactions()
     if processed: st.toast(f"Processed {processed} auto-payments!", icon="🤖")
     st.session_state['scheduler_run'] = True
 
-# FETCH CACHED DATA
 df_active = get_accounts(show_inactive=False)
 account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
-# Manual Tasks Check (Lightweight)
 manual_due = get_due_manual_tasks()
 if manual_due:
     st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
@@ -199,7 +188,6 @@ with tab1:
     start_date = col_d1.date_input("Start Date", date.today().replace(day=1)) 
     end_date = col_d2.date_input("End Date", date.today())
     
-    # We don't cache this query because dates change often
     expenses = supabase.table('transactions').select("*") \
         .eq('type', 'Expense') \
         .gte('date', str(start_date)) \
@@ -229,7 +217,6 @@ with tab1:
     selected_acc_name = st.selectbox("Select Account", account_list)
     if selected_acc_name:
         selected_acc_id = account_map[selected_acc_name]
-        # Limit history fetch to 50 items to keep it fast
         history = supabase.table('transactions').select("*") \
             .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
             .order('date', desc=True).limit(50).execute().data
@@ -251,7 +238,7 @@ with tab1:
                             if tx['from_account_id']: update_balance(tx['from_account_id'], tx['amount'])
                             update_balance(tx['to_account_id'], -tx['amount'])
                         supabase.table('transactions').delete().eq('id', del_id).execute()
-                        clear_cache() # Clear cache on delete
+                        clear_cache()
                         st.success("Deleted!")
                         st.rerun()
 
@@ -422,7 +409,52 @@ with tab4:
 with tab5:
     st.subheader("🔧 Configuration")
     
-    with st.expander("📂 Manage Categories", expanded=False):
+    # --- BULK UPLOAD SECTION ---
+    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=False):
+        st.write("Upload a CSV file to import Accounts or Categories in bulk.")
+        
+        import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
+        
+        # Template Generators
+        if import_type == "Accounts":
+            st.info("Required Columns: `name`, `type`, `balance`, `remark`")
+            # Create sample CSV
+            sample_data = pd.DataFrame([{"name": "DBS", "type": "Bank", "balance": 1000, "remark": "Main"}])
+            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
+        else:
+            st.info("Required Columns: `name`, `type` (Expense/Income)")
+            sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}])
+            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
+
+        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+        
+        if uploaded_file and st.button("Start Import"):
+            try:
+                df_upload = pd.read_csv(uploaded_file)
+                if import_type == "Accounts":
+                    # Add defaults for missing columns
+                    if 'include_net_worth' not in df_upload.columns: df_upload['include_net_worth'] = True
+                    if 'is_liquid_asset' not in df_upload.columns: df_upload['is_liquid_asset'] = True
+                    if 'sort_order' not in df_upload.columns: df_upload['sort_order'] = 99
+                    if 'is_active' not in df_upload.columns: df_upload['is_active'] = True
+                    
+                    # Convert to list of dicts for Supabase
+                    records = df_upload.to_dict('records')
+                    supabase.table('accounts').insert(records).execute()
+                else:
+                    # Categories
+                    records = df_upload.to_dict('records')
+                    supabase.table('categories').insert(records).execute()
+                    
+                clear_cache()
+                st.success(f"Successfully imported {len(records)} records!")
+            except Exception as e:
+                st.error(f"Error importing: {e}")
+
+    st.divider()
+
+    # MANAGE CATEGORIES (Single)
+    with st.expander("📂 Manage Categories (Single)", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Add Category**")
@@ -430,7 +462,7 @@ with tab5:
             new_cat_type = st.selectbox("Type", ["Expense", "Income"], key="new_cat_type")
             if st.button("Add"):
                 supabase.table('categories').insert({"name": new_cat, "type": new_cat_type}).execute()
-                clear_cache() # Clear cache so entry form updates
+                clear_cache() 
                 st.success(f"Added {new_cat}")
                 st.rerun()
         with c2:
@@ -445,7 +477,7 @@ with tab5:
 
     st.divider()
 
-    with st.expander("➕ Add New Account", expanded=False):
+    with st.expander("➕ Add New Account (Single)", expanded=False):
         with st.form("create_acc"):
             new_name = st.text_input("Name")
             new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
