@@ -548,57 +548,71 @@ with tab5:
                 
     st.divider()
     
-    # --- BULK UPLOAD SECTION ---
-    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=False):
+    # --- BULK UPLOAD SECTION (ROBUST VERSION) ---
+    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=True):
         st.write("Upload a CSV file to import Accounts or Categories in bulk.")
         
         import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
         
+        # 1. TEMPLATES
         if import_type == "Accounts":
-            st.info("Required Columns: `name`, `type`, `balance`, `remark`, `currency`, `manual_exchange_rate`")
-            # Create sample CSV with PRE-FILLED existing account types
+            st.info("Required Columns: `name`, `type`, `balance`, `currency`, `manual_exchange_rate`")
             sample_data = pd.DataFrame([
-                {"name": "DBS Multiplier", "type": "Bank", "balance": 1000, "remark": "Main", "currency": "SGD", "manual_exchange_rate": 1.0},
-                {"name": "CIMB FastSaver", "type": "Bank", "balance": 500, "remark": "Savings", "currency": "RM", "manual_exchange_rate": 0.30},
+                {"name": "DBS Multiplier", "type": "Bank", "balance": 1000.0, "remark": "Main", "currency": "SGD", "manual_exchange_rate": 1.0},
+                {"name": "CIMB FastSaver", "type": "Bank", "balance": 500.0, "remark": "Savings", "currency": "RM", "manual_exchange_rate": 0.30},
+                {"name": "Credit Card", "type": "Credit Card", "balance": -250.50, "remark": "Pending", "currency": "SGD", "manual_exchange_rate": 1.0},
             ])
-            
-            # Show list of existing to prevent duplicates
-            if not df_active.empty:
-                st.caption(f"Existing Accounts: {', '.join(df_active['name'].tolist())}")
-                
             st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
         else:
             st.info("Required Columns: `name`, `type` (Expense/Income)")
             sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}, {"name": "Salary", "type": "Income"}])
-            
-            all_cats = get_categories()
-            if all_cats:
-                 st.caption(f"Existing Categories: {', '.join(all_cats)}")
-
             st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
 
+        # 2. UPLOAD & PREVIEW
         uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
         
-        if uploaded_file and st.button("Start Import"):
+        if uploaded_file:
             try:
                 df_upload = pd.read_csv(uploaded_file)
+                
+                # CLEANING: Standardize headers to lowercase to avoid "Name" vs "name" errors
+                df_upload.columns = df_upload.columns.str.lower().str.strip()
+                
+                # DATA PREP
                 if import_type == "Accounts":
-                    # Add defaults for missing columns
-                    if 'include_net_worth' not in df_upload.columns: df_upload['include_net_worth'] = True
-                    if 'is_liquid_asset' not in df_upload.columns: df_upload['is_liquid_asset'] = True
-                    if 'sort_order' not in df_upload.columns: df_upload['sort_order'] = 99
-                    if 'is_active' not in df_upload.columns: df_upload['is_active'] = True
-                    if 'remark' not in df_upload.columns: df_upload['remark'] = ""
-                    if 'currency' not in df_upload.columns: df_upload['currency'] = "SGD"
-                    if 'manual_exchange_rate' not in df_upload.columns: df_upload['manual_exchange_rate'] = 1.0
-                    
-                    records = df_upload.to_dict('records')
-                    supabase.table('accounts').insert(records).execute()
+                    required_cols = ['name', 'type', 'balance']
+                    # Add defaults if missing
+                    defaults = {
+                        'include_net_worth': True, 'is_liquid_asset': True, 'sort_order': 99, 
+                        'is_active': True, 'remark': "", 'currency': "SGD", 'manual_exchange_rate': 1.0,
+                        'goal_amount': 0, 'goal_date': None
+                    }
+                    for col, val in defaults.items():
+                        if col not in df_upload.columns: df_upload[col] = val
+                        
                 else:
-                    records = df_upload.to_dict('records')
-                    supabase.table('categories').insert(records).execute()
+                    required_cols = ['name', 'type']
+
+                # VALIDATION
+                missing = [c for c in required_cols if c not in df_upload.columns]
+                if missing:
+                    st.error(f"❌ Your CSV is missing these columns: {missing}")
+                else:
+                    st.write("### 👀 Data Preview (Check before importing)")
+                    st.dataframe(df_upload)
                     
-                clear_cache()
-                st.success(f"Successfully imported {len(records)} records!")
+                    if st.button(f"Confirm Import {len(df_upload)} Rows"):
+                        # CRITICAL FIX: Convert NaN to None for SQL compatibility
+                        df_upload = df_upload.where(pd.notnull(df_upload), None)
+                        
+                        records = df_upload.to_dict('records')
+                        
+                        # Insert
+                        target_table = 'accounts' if import_type == "Accounts" else 'categories'
+                        supabase.table(target_table).insert(records).execute()
+                        
+                        clear_cache()
+                        st.success("✅ Import Successful! You can check the Overview/Settings tab now.")
+                        
             except Exception as e:
-                st.error(f"Error importing: {e}")
+                st.error(f"Error reading file: {e}")
