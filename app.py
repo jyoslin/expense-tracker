@@ -39,15 +39,14 @@ def get_accounts(show_inactive=False):
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
-    # Handle empty DB
-    cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order', 'is_active']
+    cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark']
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # Ensure columns exist (for legacy data compatibility)
+    # Ensure columns exist
     if 'sort_order' not in df.columns: df['sort_order'] = 99
     if 'is_active' not in df.columns: df['is_active'] = True
+    if 'remark' not in df.columns: df['remark'] = ""
     
-    # Filter inactive unless requested (e.g. for Settings)
     if not show_inactive:
         df = df[df['is_active'] == True]
         
@@ -68,25 +67,27 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active):
-    """Save account preferences including Balance Adjustment and Active Status"""
+def update_account_settings(id, name, balance, include_nw, is_asset, goal_amt, goal_date, sort_order, is_active, remark):
+    """Save account preferences including Remark"""
     data = {
         "name": name,
-        "balance": balance, # Direct balance update allowed here
+        "balance": balance,
         "include_net_worth": include_nw,
         "is_liquid_asset": is_asset,
         "goal_amount": goal_amt,
         "goal_date": str(goal_date) if goal_date else None,
         "sort_order": sort_order,
-        "is_active": is_active
+        "is_active": is_active,
+        "remark": remark
     }
     supabase.table('accounts').update(data).eq("id", id).execute()
 
-def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category):
+def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
     # Record
     supabase.table('transactions').insert({
         "date": str(date), "amount": amount, "description": description, "type": type,
-        "from_account_id": from_acc_id, "to_account_id": to_acc_id, "category": category
+        "from_account_id": from_acc_id, "to_account_id": to_acc_id, "category": category,
+        "remark": remark
     }).execute()
 
     # Update Balances
@@ -108,7 +109,7 @@ def run_scheduled_transactions():
         for task in tasks:
             cat = task.get('category', 'Recurring')
             add_transaction(task['next_run_date'], task['amount'], f"🔄 {task['description']}", 
-                          task['type'], task['from_account_id'], task['to_account_id'], cat)
+                          task['type'], task['from_account_id'], task['to_account_id'], cat, "Auto-Scheduled")
             
             if task['frequency'] == 'Monthly':
                 next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
@@ -132,7 +133,6 @@ manual_due = get_due_manual_tasks()
 if manual_due:
     st.warning(f"🔔 You have {len(manual_due)} manual transfers due!")
 
-# FETCH ACTIVE ACCOUNTS for Dropdowns
 df_active = get_accounts(show_inactive=False)
 account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
@@ -150,7 +150,7 @@ with tab1:
                 if st.button("✅ I have done this transfer", key=f"done_{task['id']}"):
                     cat = task.get('category', 'Recurring')
                     add_transaction(date.today(), task['amount'], f"✅ {task['description']}", 
-                                  task['type'], task['from_account_id'], task['to_account_id'], cat)
+                                  task['type'], task['from_account_id'], task['to_account_id'], cat, "Manual Scheduled")
                     
                     if task['frequency'] == 'Monthly':
                         next_date = datetime.strptime(task['next_run_date'], '%Y-%m-%d').date() + relativedelta(months=1)
@@ -170,6 +170,12 @@ with tab1:
     c1, c2 = st.columns(2)
     c1.metric("Net Worth", f"${net_worth:,.2f}") 
     c2.metric("Liquid Bank Assets", f"${total_liquid:,.2f}")
+
+    st.divider()
+    
+    # ACCOUNT BREAKDOWN WITH REMARKS
+    with st.expander("📂 View Account Breakdown & Notes"):
+        st.dataframe(df_active[['name', 'balance', 'type', 'remark']], hide_index=True, use_container_width=True)
 
     st.divider()
     
@@ -198,7 +204,8 @@ with tab1:
             sel_cat_view = st.selectbox("Select Category to View Details", cat_sum['category'].tolist())
             if sel_cat_view:
                 df_detail = df_exp[df_exp['category'] == sel_cat_view]
-                st.dataframe(df_detail[['date', 'description', 'amount']], hide_index=True, use_container_width=True)
+                # Added 'remark' to the drill down view
+                st.dataframe(df_detail[['date', 'description', 'remark', 'amount']], hide_index=True, use_container_width=True)
     else:
         st.info("No expenses found in this date range.")
 
@@ -214,7 +221,8 @@ with tab1:
             .order('date', desc=True).limit(50).execute().data
             
         if history:
-            st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
+            # Added 'remark' to history table
+            st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'remark', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
             with st.expander("🗑️ Delete Transaction"):
                 del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
                 if st.button("Delete Transaction"):
@@ -242,6 +250,8 @@ with tab2:
         c1, c2 = st.columns(2)
         date = c1.date_input("Date", datetime.today())
         
+        # --- NEW: REMARK FIELD ---
+        
         if t_type == "Custodial Out":
             st.info("Paying back custodial money (Split Payment)")
             cust_acc = st.selectbox("Which Custodial Account?", df_active[df_active['type']=='Custodial']['name']) if not df_active.empty else None
@@ -255,22 +265,23 @@ with tab2:
                 cash_source_name = st.selectbox("Cash Source", ["Physical Wallet (Untracked)"] + account_list)
                 cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
             
-            desc = st.text_input("Description")
+            desc = st.text_input("Description (Short)")
+            remark = st.text_area("Remark / Notes (Optional)", height=68) # NEW FIELD
             category = "Custodial" 
             
             if st.form_submit_button("Process Split Payment"):
                 if bank_amount > 0:
-                    add_transaction(date, bank_amount, f"{desc} (Bank)", "Custodial Out", account_map[bank_source], account_map[cust_acc], category)
+                    add_transaction(date, bank_amount, f"{desc} (Bank)", "Custodial Out", account_map[bank_source], account_map[cust_acc], category, remark)
                 if cash_amount > 0:
                     cash_id = account_map.get(cash_source_name)
                     if not cash_id:
                         supabase.table('transactions').insert({
                             "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
-                            "to_account_id": account_map[cust_acc], "category": category
+                            "to_account_id": account_map[cust_acc], "category": category, "remark": remark
                         }).execute()
                         update_balance(account_map[cust_acc], cash_amount)
                     else:
-                        add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category)
+                        add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category, remark)
                 st.success("Saved!")
                 st.rerun()
 
@@ -291,9 +302,11 @@ with tab2:
                 f_acc = c_a.selectbox("Custodial Source", df_active[df_active['type']=='Custodial']['name'])
                 t_acc = c_b.selectbox("Bank Received", df_active[df_active['type']=='Bank']['name'])
 
-            desc = st.text_input("Description")
+            desc = st.text_input("Description (Short)")
+            remark = st.text_area("Remark / Notes (Optional)", height=68) # NEW FIELD
+            
             if st.form_submit_button("Submit"):
-                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category)
+                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category, remark)
                 st.success("Saved!")
                 st.rerun()
 
@@ -303,14 +316,11 @@ with tab3:
     goals = df_active[df_active['type'] == 'Sinking Fund']
     
     if not goals.empty:
-        # GRAND TOTAL
         total_saved = goals['balance'].sum()
         total_goal = goals['goal_amount'].sum()
         
-        if total_goal > 0:
-            grand_progress = min(total_saved / total_goal, 1.0)
-        else:
-            grand_progress = 0.0
+        if total_goal > 0: grand_progress = min(total_saved / total_goal, 1.0)
+        else: grand_progress = 0.0
             
         st.write("### 🏆 Total Progress")
         c_gt1, c_gt2 = st.columns([1, 3])
@@ -331,7 +341,7 @@ with tab3:
                         new_goal = st.number_input("New Goal Amount", value=float(goal_amt))
                         new_date = st.date_input("New Deadline")
                         if st.form_submit_button("🔄 Rotate Goal"):
-                            update_account_settings(row['id'], row['name'], row['balance'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99), row.get('is_active', True))
+                            update_account_settings(row['id'], row['name'], row['balance'], row['include_net_worth'], row['is_liquid_asset'], new_goal, new_date, row.get('sort_order', 99), row.get('is_active', True), row.get('remark', ''))
                             st.rerun()
                 elif goal_amt > 0:
                     shortfall = goal_amt - row['balance']
@@ -431,6 +441,9 @@ with tab5:
             
             initial_bal = st.number_input(bal_label, value=0.0)
             
+            # REMARK FIELD FOR ACCOUNT
+            new_remark = st.text_area("Account Notes (e.g., Min balance, Interest rate)", height=68)
+            
             st.write("--- Goal Settings (Sinking Funds Only) ---")
             new_goal = st.number_input("Goal Amount", value=0.0)
             new_date = st.date_input("Goal Deadline", value=None)
@@ -442,7 +455,8 @@ with tab5:
                     "goal_amount": new_goal if new_type == "Sinking Fund" else 0,
                     "goal_date": str(new_date) if new_type == "Sinking Fund" else None,
                     "sort_order": 99,
-                    "is_active": True
+                    "is_active": True,
+                    "remark": new_remark
                 }
                 supabase.table('accounts').insert(data).execute()
                 st.success(f"Created {new_name}!")
@@ -450,8 +464,7 @@ with tab5:
 
     st.divider()
     
-    # EDIT ACCOUNT (NOW WITH BALANCE EDIT & ARCHIVE)
-    # We fetch ALL accounts here, including inactive, so you can restore them
+    # EDIT ACCOUNT
     df_all_accounts = get_accounts(show_inactive=True)
     edit_list = df_all_accounts['name'].tolist() if not df_all_accounts.empty else []
     
@@ -466,9 +479,11 @@ with tab5:
             upd_name = c_name.text_input("Account Name", value=row['name'])
             upd_sort = c_sort.number_input("Sort Order", value=int(row.get('sort_order', 99)), step=1)
             
-            # DIRECT BALANCE EDIT
             upd_bal = st.number_input("Current Balance (Manual Adjustment)", value=float(row['balance']))
             
+            # REMARK EDITING
+            upd_remark = st.text_area("Account Notes", value=row.get('remark', ''))
+
             c1, c2, c3 = st.columns(3)
             inc_nw = c1.checkbox("Include in Net Worth?", value=row['include_net_worth'])
             is_liq = c2.checkbox("Is Actual Bank Asset?", value=row['is_liquid_asset'])
@@ -483,6 +498,6 @@ with tab5:
                 g_date = st.date_input("Goal Deadline", value=datetime.strptime(row['goal_date'], '%Y-%m-%d') if row['goal_date'] else None)
             
             if st.form_submit_button("Save Changes"):
-                update_account_settings(row['id'], upd_name, upd_bal, inc_nw, is_liq, g_amt, g_date, upd_sort, is_active)
+                update_account_settings(row['id'], upd_name, upd_bal, inc_nw, is_liq, g_amt, g_date, upd_sort, is_active, upd_remark)
                 st.success("Updated! Refreshing...")
                 st.rerun()
