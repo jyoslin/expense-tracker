@@ -2,16 +2,14 @@ import streamlit as st
 import hmac
 from supabase import create_client, Client
 import pandas as pd
-import numpy as np # Needed for robust NaN checking
+import numpy as np
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
-import io
 
 # --- 1. SECURITY & SETUP ---
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
 def check_password():
-    """Returns `True` if the user had the correct password."""
     def password_entered():
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
@@ -51,7 +49,6 @@ def get_accounts(show_inactive=False):
             
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # Backfill missing columns
     defaults = {
         'sort_order': 99, 'is_active': True, 'remark': "", 
         'currency': "SGD", 'manual_exchange_rate': 1.0, 
@@ -67,48 +64,50 @@ def get_accounts(show_inactive=False):
 
 @st.cache_data(ttl=3600)
 def get_categories(type_filter=None):
+    # Fetch full objects so we can get budget_limit if needed
     query = supabase.table('categories').select("*")
     if type_filter:
         query = query.eq('type', type_filter)
     data = query.execute().data
-    if not data: return []
-    return sorted([item['name'] for item in data])
+    if not data: return pd.DataFrame(columns=['id', 'name', 'type', 'budget_limit'])
+    
+    df = pd.DataFrame(data)
+    if 'budget_limit' not in df.columns: df['budget_limit'] = 0.0
+    return df.sort_values('name')
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
+    # Fetch fresh to avoid race conditions
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def update_account_direct(changes_df):
-    """
-    Process edits from st.data_editor.
-    changes_df is the full dataframe AFTER user edits.
-    We iterate and update Supabase.
-    """
-    # Convert to records
+def update_table_direct(table_name, changes_df):
+    """Generic updater for accounts or categories"""
     records = changes_df.to_dict('records')
-    
-    # We loop update because upserting whole table is risky with ID conflicts in some SQL setups
-    # Optimization: In a real prod app, we'd use 'upsert' with 'id' key.
     for row in records:
-        # Clean data for JSON compliance
-        if pd.isna(row['goal_amount']): row['goal_amount'] = 0
-        if pd.isna(row['manual_exchange_rate']): row['manual_exchange_rate'] = 1.0
+        # Sanitize
+        if table_name == 'accounts':
+            if pd.isna(row.get('goal_amount')): row['goal_amount'] = 0
+            if pd.isna(row.get('manual_exchange_rate')): row['manual_exchange_rate'] = 1.0
+            data = {
+                "name": row['name'], "balance": row['balance'], "type": row['type'],
+                "currency": row['currency'], "manual_exchange_rate": row['manual_exchange_rate'],
+                "remark": row['remark'], "is_active": row['is_active'], "sort_order": row['sort_order'],
+                "include_net_worth": row['include_net_worth'], "is_liquid_asset": row['is_liquid_asset']
+            }
+        elif table_name == 'categories':
+             if pd.isna(row.get('budget_limit')): row['budget_limit'] = 0
+             data = {
+                 "name": row['name'], "type": row['type'], "budget_limit": row['budget_limit']
+             }
         
-        data = {
-            "name": row['name'],
-            "balance": row['balance'],
-            "type": row['type'],
-            "currency": row['currency'],
-            "manual_exchange_rate": row['manual_exchange_rate'],
-            "remark": row['remark'],
-            "is_active": row['is_active'],
-            "sort_order": row['sort_order'],
-            "include_net_worth": row['include_net_worth'],
-            "is_liquid_asset": row['is_liquid_asset']
-        }
-        supabase.table('accounts').update(data).eq("id", row['id']).execute()
+        # If ID exists, update. If new (added via data_editor), insert.
+        if row.get('id'):
+            supabase.table(table_name).update(data).eq("id", row['id']).execute()
+        else:
+            # Insert new row
+            supabase.table(table_name).insert(data).execute()
     
     clear_cache()
 
@@ -121,13 +120,11 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
 
     if type == "Expense": update_balance(from_acc_id, -amount)
     elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
-    elif type in ["Transfer", "Custodial In"]:
-        update_balance(from_acc_id, -amount)
-        update_balance(to_acc_id, amount)
-    elif type == "Custodial Out":
-        if from_acc_id: update_balance(from_acc_id, -amount) 
-        update_balance(to_acc_id, amount)
-    
+    elif type in ["Transfer", "Custodial In", "Custodial Out"]:
+        # Logic: Transfer moves money FROM -> TO
+        if from_acc_id: update_balance(from_acc_id, -amount)
+        if to_acc_id: update_balance(to_acc_id, amount)
+
     clear_cache()
 
 def run_scheduled_transactions():
@@ -152,7 +149,63 @@ def get_due_manual_tasks():
     today = datetime.today().date()
     return supabase.table('schedule').select("*").lte('next_run_date', str(today)).eq('is_manual', True).execute().data
 
-# --- 3. APP INTERFACE ---
+# --- 3. ANALYTICS HELPERS ---
+def calculate_net_worth_trend(df_accounts):
+    """Reconstructs net worth history by reversing transactions"""
+    if df_accounts.empty: return pd.DataFrame()
+    
+    # 1. Get current total Net Worth
+    df_nw = df_accounts[df_accounts['include_net_worth'] == True].copy()
+    df_nw['sgd_bal'] = df_nw['balance'] * df_nw['manual_exchange_rate']
+    current_nw = df_nw['sgd_bal'].sum()
+    
+    # 2. Get last 90 days transactions
+    lookback_days = 90
+    start_date = date.today() - timedelta(days=lookback_days)
+    
+    txs = supabase.table('transactions').select("*").gte('date', str(start_date)).order('date', desc=True).execute().data
+    if not txs: return pd.DataFrame()
+    
+    df_tx = pd.DataFrame(txs)
+    df_tx['amount'] = pd.to_numeric(df_tx['amount'])
+    df_tx['date'] = pd.to_datetime(df_tx['date']).dt.date
+    
+    # 3. Create daily timeline
+    dates = [date.today() - timedelta(days=i) for i in range(lookback_days + 1)]
+    dates.reverse() # Oldest to Newest
+    
+    history = []
+    running_nw = current_nw
+    
+    # We walk BACKWARDS from today. 
+    # Today's NW is known. Yesterday's NW = Today's NW - Income + Expense
+    
+    # Group transactions by date
+    tx_groups = df_tx.groupby('date')
+    
+    # Re-reverse dates to go from Today -> Past
+    dates_desc = sorted(dates, reverse=True)
+    
+    history_data = []
+    
+    for d in dates_desc:
+        history_data.append({'date': d, 'net_worth': running_nw})
+        
+        if d in tx_groups.groups:
+            day_txs = tx_groups.get_group(d)
+            for _, row in day_txs.iterrows():
+                amt = row['amount']
+                # Reverse logic: If we spent money today, we had MORE yesterday.
+                if row['type'] == 'Expense':
+                    running_nw += amt # Add back expense
+                elif row['type'] in ['Income', 'Refund']:
+                    running_nw -= amt # Subtract income
+                # Transfers don't change Net Worth usually, unless across tracked/untracked
+                # Assuming all transfers are internal for now => No Change
+                
+    return pd.DataFrame(history_data).sort_values('date')
+
+# --- 4. APP INTERFACE ---
 st.title("💰 My Wealth Manager")
 
 if 'scheduler_run' not in st.session_state:
@@ -174,11 +227,11 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goa
 # --- TAB 1: OVERVIEW ---
 with tab1:
     if manual_due:
-        st.write("### 🔔 Pending Manual Transfers")
-        for task in manual_due:
-            with st.expander(f"Due: {task['next_run_date']} - {task['description']} (${task['amount']})", expanded=True):
-                st.write(f"**Action:** {task['type']} of ${task['amount']}")
-                if st.button("✅ I have done this transfer", key=f"done_{task['id']}"):
+        with st.expander(f"🔔 Pending Manual Transfers ({len(manual_due)})", expanded=True):
+            for task in manual_due:
+                c1, c2 = st.columns([4,1])
+                c1.write(f"**{task['next_run_date']}:** {task['description']} (${task['amount']})")
+                if c2.button("✅ Done", key=f"done_{task['id']}"):
                     cat = task.get('category', 'Recurring')
                     add_transaction(date.today(), task['amount'], f"✅ {task['description']}", 
                                   task['type'], task['from_account_id'], task['to_account_id'], cat, "Manual Scheduled")
@@ -189,170 +242,142 @@ with tab1:
                     else:
                         supabase.table('schedule').delete().eq("id", task['id']).execute()
                     st.success("Recorded!")
-                    # No rerun here to prevent jumping tabs, but usually Overview is fine to rerun.
-                    # We will just clear cache and let user manually refresh or see toast.
                     clear_cache()
-        st.divider()
+                    st.rerun()
 
-    st.subheader("Current Finance Stand (Base: SGD)")
-    
+    # --- NET WORTH & TREND ---
     if not df_active.empty:
         df_calc = df_active.copy()
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
-        
-        nw_accounts = df_calc[df_calc['include_net_worth'] == True]
-        net_worth = nw_accounts['sgd_value'].sum()
-        
-        asset_accounts = df_calc[df_calc['is_liquid_asset'] == True]
-        total_liquid = asset_accounts['sgd_value'].sum()
+        net_worth = df_calc[df_calc['include_net_worth'] == True]['sgd_value'].sum()
+        liquid = df_calc[df_calc['is_liquid_asset'] == True]['sgd_value'].sum()
     else:
-        net_worth = 0
-        total_liquid = 0
+        net_worth, liquid = 0, 0
     
     c1, c2 = st.columns(2)
-    c1.metric("Net Worth (Approx SGD)", f"${net_worth:,.2f}") 
-    c2.metric("Liquid Assets (Approx SGD)", f"${total_liquid:,.2f}")
+    c1.metric("Net Worth (SGD)", f"${net_worth:,.2f}") 
+    c2.metric("Liquid Assets (SGD)", f"${liquid:,.2f}")
+
+    # Trend Chart
+    st.caption("📈 90-Day Net Worth Trend")
+    trend_df = calculate_net_worth_trend(df_active)
+    if not trend_df.empty:
+        st.area_chart(trend_df.set_index('date')['net_worth'], height=200, color="#2E86C1")
 
     st.divider()
     
-    with st.expander("📂 View Account Breakdown (Original Currency)"):
-        # Display currency in the table
-        display_cols = ['name', 'balance', 'currency', 'type', 'remark']
-        st.dataframe(df_active[display_cols], hide_index=True, use_container_width=True)
+    # --- BUDGETS & SPENDING ---
+    st.subheader("📊 Monthly Budgets")
+    
+    # Get expenses for current month
+    today = date.today()
+    start_month = today.replace(day=1)
+    # End of month calc
+    next_month = today.replace(day=28) + timedelta(days=4)
+    end_month = next_month - timedelta(days=next_month.day)
 
-    st.divider()
-    
-    st.subheader("📊 Spending by Category")
-    col_d1, col_d2 = st.columns(2)
-    start_date = col_d1.date_input("Start Date", date.today().replace(day=1)) 
-    end_date = col_d2.date_input("End Date", date.today())
-    
     expenses = supabase.table('transactions').select("*") \
         .eq('type', 'Expense') \
-        .gte('date', str(start_date)) \
-        .lte('date', str(end_date)) \
-        .order('date', desc=True).execute().data
-        
+        .gte('date', str(start_month)) \
+        .lte('date', str(end_month)).execute().data
+    
+    # Get Categories with Budgets
+    df_cats = get_categories("Expense")
+    budgets = df_cats[df_cats['budget_limit'] > 0]
+    
     if expenses:
         df_exp = pd.DataFrame(expenses)
-        if 'category' in df_exp.columns and not df_exp.empty:
-            cat_sum = df_exp.groupby('category')['amount'].sum().reset_index().sort_values('amount', ascending=False)
-            c_chart, c_list = st.columns([2, 1])
-            with c_chart: st.bar_chart(cat_sum.set_index('category'))
-            with c_list: st.dataframe(cat_sum, hide_index=True, use_container_width=True)
-            
-            st.write("---")
-            st.write("**📂 Drill Down: Transaction Details**")
-            sel_cat_view = st.selectbox("Select Category to View Details", cat_sum['category'].tolist())
-            if sel_cat_view:
-                df_detail = df_exp[df_exp['category'] == sel_cat_view]
-                st.dataframe(df_detail[['date', 'description', 'remark', 'amount']], hide_index=True, use_container_width=True)
+        spent_sum = df_exp.groupby('category')['amount'].sum()
     else:
-        st.info("No expenses found in this date range.")
-
-    st.divider()
-    
-    st.subheader("🔍 Account Details & History")
-    selected_acc_name = st.selectbox("Select Account", account_list)
-    if selected_acc_name:
-        selected_acc_id = account_map[selected_acc_name]
-        history = supabase.table('transactions').select("*") \
-            .or_(f"from_account_id.eq.{selected_acc_id},to_account_id.eq.{selected_acc_id}") \
-            .order('date', desc=True).limit(50).execute().data
+        spent_sum = pd.Series()
+        
+    # Display Progress Bars
+    if not budgets.empty:
+        for _, row in budgets.iterrows():
+            cat_name = row['name']
+            limit = row['budget_limit']
+            spent = spent_sum.get(cat_name, 0.0)
             
-        if history:
-            acc_curr = df_active[df_active['id'] == selected_acc_id].iloc[0]['currency']
-            st.write(f"**Currency: {acc_curr}**")
-            st.dataframe(pd.DataFrame(history)[['date', 'category', 'description', 'remark', 'amount', 'type', 'id']], hide_index=True, use_container_width=True)
-            
-            with st.expander("🗑️ Delete Transaction"):
-                del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
-                if st.button("Delete Transaction"):
-                    tx = supabase.table('transactions').select("*").eq('id', del_id).execute().data
-                    if tx:
-                        tx = tx[0]
-                        if tx['type'] == "Expense": update_balance(tx['from_account_id'], tx['amount'])
-                        elif tx['type'] in ["Income", "Refund"]: update_balance(tx['to_account_id'], -tx['amount'])
-                        elif tx['type'] in ["Transfer", "Custodial In"]:
-                            update_balance(tx['from_account_id'], tx['amount'])
-                            update_balance(tx['to_account_id'], -tx['amount'])
-                        elif tx['type'] == "Custodial Out":
-                            if tx['from_account_id']: update_balance(tx['from_account_id'], tx['amount'])
-                            update_balance(tx['to_account_id'], -tx['amount'])
-                        supabase.table('transactions').delete().eq('id', del_id).execute()
-                        clear_cache()
-                        st.success("Deleted!")
-                        # No rerun, stay here.
+            pct = min(spent / limit, 1.0)
+            st.write(f"**{cat_name}** (${spent:,.0f} / ${limit:,.0f})")
+            bar_color = "red" if spent > limit else "blue"
+            st.progress(pct)
+    else:
+        st.info("No budgets set. Go to Settings > Edit Categories to add limits.")
 
 # --- TAB 2: ENTRY ---
 with tab2:
     st.subheader("New Transaction")
-    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial In", "Custodial Out"], horizontal=True)
+    
+    # Simplified Types - "Custodial Out" is now just an Expense
+    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial In"], horizontal=True)
     
     with st.form("entry"):
         c1, c2 = st.columns(2)
-        date = c1.date_input("Date", datetime.today())
+        tx_date = c1.date_input("Date", datetime.today())
         
-        if t_type == "Custodial Out":
-            st.info("Paying back custodial money (Split Payment)")
-            cust_acc = st.selectbox("Which Custodial Account?", df_active[df_active['type']=='Custodial']['name']) if not df_active.empty else None
+        # --- SPLIT PAYMENT LOGIC (Replaces old Custodial Out) ---
+        is_split = False
+        if t_type == "Expense":
+            is_split = st.checkbox("🔀 Split Payment? (Pay from 2 sources)")
             
-            st.write("--- Sources ---")
-            col_bank, col_cash = st.columns(2)
-            with col_bank:
-                bank_source = st.selectbox("Bank Source", df_active[df_active['type'].isin(['Bank', 'Cash'])]['name'])
-                bank_amount = st.number_input("Amount from Bank", min_value=0.0, format="%.2f")
-            with col_cash:
-                cash_source_name = st.selectbox("Cash Source", ["Physical Wallet (Untracked)"] + account_list)
-                cash_amount = st.number_input("Amount from Cash", min_value=0.0, format="%.2f")
-            
-            desc = st.text_input("Description (Short)")
-            remark = st.text_area("Remark / Notes (Optional)", height=68)
-            category = "Custodial" 
-            
-            if st.form_submit_button("Process Split Payment"):
-                if bank_amount > 0:
-                    add_transaction(date, bank_amount, f"{desc} (Bank)", "Custodial Out", account_map[bank_source], account_map[cust_acc], category, remark)
-                if cash_amount > 0:
-                    cash_id = account_map.get(cash_source_name)
-                    if not cash_id:
-                        supabase.table('transactions').insert({
-                            "date": str(date), "amount": cash_amount, "description": f"{desc} (Cash)", "type": "Custodial Out",
-                            "to_account_id": account_map[cust_acc], "category": category, "remark": remark
-                        }).execute()
-                        update_balance(account_map[cust_acc], cash_amount)
-                        clear_cache()
-                    else:
-                        add_transaction(date, cash_amount, f"{desc} (Cash)", "Custodial Out", cash_id, account_map[cust_acc], category, remark)
-                st.success("Saved!")
-                # Removed st.rerun()
+            if is_split:
+                st.info("Split a single payment between two accounts (e.g. Bank + Cash)")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    acc1 = st.selectbox("Source 1", non_loan_accounts, key="src1")
+                    amt1 = st.number_input("Amount 1", min_value=0.0, format="%.2f")
+                with col_b:
+                    acc2 = st.selectbox("Source 2", non_loan_accounts, key="src2")
+                    amt2 = st.number_input("Amount 2", min_value=0.0, format="%.2f")
+                
+                # Logic for Split: We treat it as 2 separate expense entries
+                
+            else:
+                f_acc = st.selectbox("Paid From", non_loan_accounts)
+                amt = c2.number_input("Amount", min_value=0.01)
 
-        else:
+        elif t_type in ["Income", "Refund"]:
+            t_acc = st.selectbox("Deposit To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
-            cat_options = get_categories("Income") if t_type == "Income" else get_categories("Expense")
-            category = st.selectbox("Category", cat_options)
-            
-            f_acc, t_acc = None, None
-            if t_type == "Expense": f_acc = st.selectbox("Paid From", non_loan_accounts)
-            elif t_type in ["Income", "Refund"]: t_acc = st.selectbox("Deposit To", account_list)
-            elif t_type == "Transfer":
-                c_a, c_b = st.columns(2)
-                f_acc = c_a.selectbox("From", non_loan_accounts)
-                t_acc = c_b.selectbox("To", account_list)
-            elif t_type == "Custodial In":
-                c_a, c_b = st.columns(2)
-                f_acc = c_a.selectbox("Custodial Source", df_active[df_active['type']=='Custodial']['name'])
-                t_acc = c_b.selectbox("Bank Received", df_active[df_active['type']=='Bank']['name'])
 
-            desc = st.text_input("Description (Short)")
-            remark = st.text_area("Remark / Notes (Optional)", height=68)
-            
-            if st.form_submit_button("Submit"):
-                add_transaction(date, amt, desc, t_type, account_map.get(f_acc), account_map.get(t_acc), category, remark)
-                st.success("Saved!")
-                # Removed st.rerun()
+        elif t_type == "Transfer":
+            c_a, c_b = st.columns(2)
+            f_acc = c_a.selectbox("From", non_loan_accounts)
+            t_acc = c_b.selectbox("To", account_list)
+            amt = c2.number_input("Amount", min_value=0.01)
 
-# --- TAB 3: GOALS ---
+        elif t_type == "Custodial In":
+            # Taking money from Custodial Account -> Bank
+            c_a, c_b = st.columns(2)
+            f_acc = c_a.selectbox("Custodial Source", df_active[df_active['type']=='Custodial']['name'])
+            t_acc = c_b.selectbox("Bank Received", df_active[df_active['type']=='Bank']['name'])
+            amt = c2.number_input("Amount", min_value=0.01)
+
+        # Categories
+        cat_type = "Income" if t_type == "Income" else "Expense"
+        cat_options = get_categories(cat_type)['name'].tolist()
+        category = st.selectbox("Category", cat_options)
+        
+        desc = st.text_input("Description")
+        remark = st.text_area("Notes", height=68)
+        
+        if st.form_submit_button("Submit Transaction"):
+            if t_type == "Expense" and is_split:
+                if amt1 > 0:
+                    add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, category, remark)
+                if amt2 > 0:
+                    add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, category, remark)
+            else:
+                # Standard
+                f_id = account_map.get(f_acc) if 'f_acc' in locals() and f_acc else None
+                t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
+                add_transaction(tx_date, amt, desc, t_type, f_id, t_id, category, remark)
+            
+            st.success("Saved!")
+            clear_cache()
+
+# --- TAB 3: GOALS (Sinking Funds) ---
 with tab3:
     st.subheader("🎯 Sinking Funds Dashboard")
     goals = df_active[df_active['type'] == 'Sinking Fund']
@@ -364,32 +389,23 @@ with tab3:
         
         total_saved = goals_calc['saved_sgd'].sum()
         total_goal = goals_calc['goal_sgd'].sum()
-        
-        if total_goal > 0: grand_progress = min(total_saved / total_goal, 1.0)
-        else: grand_progress = 0.0
+        grand_progress = min(total_saved / total_goal, 1.0) if total_goal > 0 else 0.0
             
-        st.write("### 🏆 Total Progress (SGD Equivalent)")
-        c_gt1, c_gt2 = st.columns([1, 3])
-        c_gt1.metric("Total Saved", f"${total_saved:,.2f}", f"Target: ${total_goal:,.2f}")
-        c_gt2.write("")
-        c_gt2.write("Overall Completion:")
-        c_gt2.progress(grand_progress)
+        st.write("### 🏆 Total Progress")
+        st.progress(grand_progress)
+        st.caption(f"Saved: ${total_saved:,.0f} / ${total_goal:,.0f} (SGD)")
         
         st.divider()
 
-        st.write("### Individual Funds (Original Currency)")
-        for index, row in goals.iterrows():
-            curr = row['currency']
-            with st.expander(f"📌 {row['name']} (Current: {curr} {row['balance']:,.2f})", expanded=True):
-                goal_amt = row['goal_amount'] or 0
-                if row['balance'] >= goal_amt and goal_amt > 0:
-                    st.success("🎉 GOAL ACHIEVED!")
-                    # Just show info, no form needed if completed, or can keep form to rotate
-                elif goal_amt > 0:
-                    shortfall = goal_amt - row['balance']
-                    progress = min(row['balance'] / goal_amt, 1.0)
-                    st.progress(progress)
-                    st.caption(f"Target: {curr} {goal_amt:,.2f}")
+        cols = st.columns(3)
+        for i, (index, row) in enumerate(goals.iterrows()):
+            with cols[i % 3]:
+                st.write(f"**{row['name']}**")
+                curr = row['currency']
+                goal_amt = row['goal_amount'] or 1
+                prog = min(row['balance'] / goal_amt, 1.0)
+                st.progress(prog)
+                st.caption(f"{curr} {row['balance']:,.0f} / {goal_amt:,.0f}")
     else:
         st.info("No Sinking Funds created yet.")
 
@@ -397,16 +413,16 @@ with tab3:
 with tab4:
     st.subheader("Manage Future Payments")
     
-    with st.expander("➕ Add New Schedule", expanded=True):
+    with st.expander("➕ Add Schedule", expanded=False):
         with st.form("sch_form"):
-            s_desc = st.text_input("Description (e.g. Rent, Investment)")
+            s_desc = st.text_input("Description")
             c1, c2, c3 = st.columns(3)
             s_amount = c1.number_input("Amount", min_value=0.01)
             s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
             s_date = c3.date_input("Start Date", datetime.today())
             
-            s_cat = st.selectbox("Category", get_categories())
-            s_manual = st.checkbox("🔔 Manual Reminder? (Tick if you do the transfer manually)", value=False)
+            s_cat = st.selectbox("Category", get_categories()['name'].tolist())
+            s_manual = st.checkbox("🔔 Manual Reminder? (Tick if you do transfer manually)", value=False)
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
             s_from, s_to = None, None
@@ -426,150 +442,64 @@ with tab4:
                     "is_manual": s_manual, "category": s_cat
                 }).execute()
                 st.success("Scheduled!")
-                # Removed st.rerun()
+                clear_cache()
 
-    st.divider()
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
         df_up = pd.DataFrame(upcoming)
-        df_up['Manual?'] = df_up['is_manual'].apply(lambda x: "🔔 Manual" if x else "🤖 Auto")
-        if 'category' not in df_up.columns: df_up['category'] = "-"
-        st.dataframe(df_up[['next_run_date', 'description', 'category', 'amount', 'frequency', 'Manual?', 'id']], hide_index=True)
+        st.dataframe(df_up[['next_run_date', 'description', 'amount', 'frequency']], hide_index=True, use_container_width=True)
         
-        del_sch_id = st.number_input("Schedule ID to Delete", min_value=0)
-        if st.button("Delete Schedule Item"):
-            supabase.table('schedule').delete().eq("id", del_sch_id).execute()
-            st.rerun() # Schedule delete still reruns to refresh list, that's fine
+        with st.popover("🗑️ Delete Item"):
+            del_id = st.number_input("ID to delete", step=1)
+            if st.button("Delete"):
+                supabase.table('schedule').delete().eq("id", del_id).execute()
+                st.rerun()
 
 # --- TAB 5: SETTINGS ---
 with tab5:
     st.subheader("🔧 Configuration")
     
-    # 1. DIRECT TABLE EDITING (NEW!)
-    st.write("### 📝 Quick Edit Accounts")
-    st.info("Double-click a cell to edit. Click 'Save Changes' when done.")
+    # 1. CATEGORY EDITOR (New Request)
+    st.write("### 🏷️ Edit Categories (Bulk)")
+    st.info("Add new rows at the bottom. Delete by selecting rows.")
     
-    # Get all accounts (including inactive)
-    df_all_accounts = get_accounts(show_inactive=True)
-    
-    if not df_all_accounts.empty:
-        # Columns we allow user to edit
-        edit_cols = ['name', 'balance', 'currency', 'manual_exchange_rate', 'remark', 'sort_order', 'is_active', 'include_net_worth', 'is_liquid_asset', 'id', 'type']
-        
-        edited_df = st.data_editor(
-            df_all_accounts[edit_cols], 
-            key="account_editor",
-            disabled=['id'], # Don't let them edit ID
+    df_cats = get_categories()
+    if not df_cats.empty:
+        edited_cats = st.data_editor(
+            df_cats[['id', 'name', 'type', 'budget_limit']], 
+            key="cat_editor",
+            num_rows="dynamic",
+            disabled=['id'],
             column_config={
-                "is_active": st.column_config.CheckboxColumn("Active?", default=True),
-                "sort_order": st.column_config.NumberColumn("Sort (1=Top)", min_value=1, max_value=999),
+                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
+                "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f")
             }
         )
         
-        if st.button("💾 Save Table Changes"):
-            update_account_direct(edited_df)
-            st.success("Changes saved to Database!")
-            # No rerun needed, cache cleared
+        if st.button("💾 Save Categories"):
+            update_table_direct('categories', edited_cats)
+            st.success("Categories Updated!")
 
     st.divider()
 
-    # 2. CREATE ACCOUNT (Single)
-    with st.expander("➕ Add New Account (Single)", expanded=False):
-        with st.form("create_acc"):
-            new_name = st.text_input("Name")
-            new_type = st.selectbox("Type", ["Bank", "Credit Card", "Custodial", "Sinking Fund", "Cash", "Loan", "Investment"])
-            
-            c_curr, c_rate = st.columns(2)
-            new_curr = c_curr.selectbox("Currency", ["SGD", "USD", "RM", "CNY", "EUR", "GBP"])
-            new_rate = c_rate.number_input("Exchange Rate (to SGD)", value=1.00, help="e.g. For RM, put 0.30")
-            
-            bal_label = "Starting Balance"
-            if new_type == "Sinking Fund": bal_label = "Existing Saved Amount"
-            elif new_type == "Loan": bal_label = "Current Loan Amount (Negative Value)"
-            
-            initial_bal = st.number_input(bal_label, value=0.0)
-            new_remark = st.text_area("Account Notes", height=68)
-            
-            st.write("--- Goal Settings (Sinking Funds Only) ---")
-            new_goal = st.number_input("Goal Amount", value=0.0)
-            new_date = st.date_input("Goal Deadline", value=None)
-            
-            if st.form_submit_button("Create Account"):
-                data = {
-                    "name": new_name, "type": new_type, "balance": initial_bal,
-                    "include_net_worth": True, "is_liquid_asset": True if new_type in ['Bank', 'Cash', 'Investment'] else False,
-                    "goal_amount": new_goal if new_type == "Sinking Fund" else 0,
-                    "goal_date": str(new_date) if new_type == "Sinking Fund" else None,
-                    "sort_order": 99,
-                    "is_active": True,
-                    "remark": new_remark,
-                    "currency": new_curr,
-                    "manual_exchange_rate": new_rate
-                }
-                supabase.table('accounts').insert(data).execute()
-                clear_cache()
-                st.success(f"Created {new_name}!")
-                # Removed st.rerun()
-
-    st.divider()
+    # 2. ACCOUNT EDITOR
+    st.write("### 🏦 Edit Accounts")
+    df_all_accounts = get_accounts(show_inactive=True)
     
-    # 3. BULK UPLOAD (FIXED NAN ERROR)
-    with st.expander("📂 Bulk Import (Excel/CSV)", expanded=True):
-        st.write("Upload a CSV file to import Accounts or Categories in bulk.")
-        import_type = st.radio("What are you importing?", ["Accounts", "Categories"], horizontal=True)
+    if not df_all_accounts.empty:
+        edit_cols = ['name', 'balance', 'currency', 'manual_exchange_rate', 'remark', 'sort_order', 'is_active', 'include_net_worth', 'is_liquid_asset', 'id', 'type']
         
-        if import_type == "Accounts":
-            st.info("Required Columns: `name`, `type`, `balance` | Optional: `sort_order`, `remark`")
-            sample_data = pd.DataFrame([
-                {"name": "DBS Multiplier", "type": "Bank", "balance": 1000.0, "sort_order": 1, "remark": "Main"},
-                {"name": "CIMB FastSaver", "type": "Bank", "balance": 500.0, "sort_order": 2, "remark": "Savings"},
-            ])
-            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "accounts_template.csv", "text/csv")
-        else:
-            st.info("Required Columns: `name`, `type` (Expense/Income)")
-            sample_data = pd.DataFrame([{"name": "Groceries", "type": "Expense"}, {"name": "Salary", "type": "Income"}])
-            st.download_button("Download Template CSV", sample_data.to_csv(index=False).encode('utf-8'), "categories_template.csv", "text/csv")
-
-        uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+        edited_accs = st.data_editor(
+            df_all_accounts[edit_cols], 
+            key="account_editor",
+            disabled=['id'],
+            column_config={
+                "is_active": st.column_config.CheckboxColumn("Active?", default=True),
+                "sort_order": st.column_config.NumberColumn("Sort", min_value=1, max_value=999),
+            }
+        )
         
-        if uploaded_file:
-            try:
-                df_upload = pd.read_csv(uploaded_file)
-                df_upload.columns = df_upload.columns.str.lower().str.strip()
-                
-                if import_type == "Accounts":
-                    required_cols = ['name', 'type', 'balance']
-                    defaults = {
-                        'include_net_worth': True, 'is_liquid_asset': True, 
-                        'sort_order': 99, 'is_active': True, 'remark': "", 
-                        'currency': "SGD", 'manual_exchange_rate': 1.0, 
-                        'goal_amount': 0, 'goal_date': None
-                    }
-                    for col, val in defaults.items():
-                        if col not in df_upload.columns: df_upload[col] = val
-                else:
-                    required_cols = ['name', 'type']
-
-                missing = [c for c in required_cols if c not in df_upload.columns]
-                if missing:
-                    st.error(f"❌ Your CSV is missing these columns: {missing}")
-                else:
-                    st.write("### 👀 Data Preview")
-                    st.dataframe(df_upload)
-                    
-                    if st.button(f"Confirm Import {len(df_upload)} Rows"):
-                        # CRITICAL FIX: REPLACE NaN/Inf with None
-                        df_upload = df_upload.replace([np.inf, -np.inf, np.nan], None)
-                        df_upload = df_upload.where(pd.notnull(df_upload), None)
-                        
-                        records = df_upload.to_dict('records')
-                        
-                        target_table = 'accounts' if import_type == "Accounts" else 'categories'
-                        supabase.table(target_table).insert(records).execute()
-                        
-                        clear_cache()
-                        st.success("✅ Import Successful!")
-                        
-            except Exception as e:
-                st.error(f"Error reading file: {e}")
+        if st.button("💾 Save Accounts"):
+            update_table_direct('accounts', edited_accs)
+            st.success("Accounts Updated!")
