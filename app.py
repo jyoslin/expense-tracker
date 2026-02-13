@@ -96,9 +96,11 @@ def update_balance(account_id, amount_change):
 def save_bulk_editor(table_name, df_edited):
     records = df_edited.to_dict('records')
     for row in records:
-        # 🚨 CRITICAL FIX: Deep clean the row, converting ANY pandas NaN to standard Python None
         clean_row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
         
+        if not clean_row.get('name') or str(clean_row.get('name')).strip() == "":
+            continue 
+            
         if table_name == 'accounts':
             data = {
                 "name": clean_row.get('name'), 
@@ -138,6 +140,7 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
 
     if type == "Expense": update_balance(from_acc_id, -amount)
     elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
+    elif type == "Increase Loan": update_balance(to_acc_id, amount) # Adds to the loan amount
     elif type == "Transfer":
         if from_acc_id: update_balance(from_acc_id, -amount)
         if to_acc_id: update_balance(to_acc_id, amount)
@@ -149,6 +152,8 @@ st.title("💰 My Wealth Manager")
 df_active = get_accounts(show_inactive=False)
 account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
+
+# Non-loan accounts are strictly enforced for Expenses/Transfers FROM
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
 # --- SIDEBAR NAVIGATION ---
@@ -193,6 +198,9 @@ if menu == "📊 Overview":
                     desc = f"Transfer: {desc}"
                 elif row['type'] == 'Expense':
                     amt = -amt
+                elif row['type'] == 'Increase Loan':
+                    amt = amt # Increases loan balance
+                
                 view_data.append({
                     "Date": row['date'], "Description": desc, "Amount": amt, 
                     "Category": row['category'], "Type": row['type']
@@ -205,7 +213,7 @@ if menu == "📊 Overview":
 elif menu == "📝 Entry":
     st.header("📝 New Transaction")
     
-    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In"], horizontal=True)
+    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan"], horizontal=True)
     
     is_split = False
     if t_type == "Expense":
@@ -257,6 +265,16 @@ elif menu == "📝 Entry":
             f_acc = c_a.selectbox("From", non_loan_accounts)
             t_acc = c_b.selectbox("To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
+            
+        elif t_type == "Increase Loan":
+            st.info("📈 Increase the amount you owe on a loan (e.g. adding interest or borrowing more).")
+            loan_opts = df_active[df_active['type'] == 'Loan']['name'].tolist()
+            if len(loan_opts) == 0:
+                st.warning("No Loan accounts found. Add one in Settings first.")
+                t_acc = None
+            else:
+                t_acc = st.selectbox("Select Loan Account", loan_opts)
+            amt = c2.number_input("Amount to Add to Loan", min_value=0.01)
 
         # Categories
         cat_type = "Income" if t_type in ["Income", "Custodial In"] else "Expense"
@@ -271,27 +289,37 @@ elif menu == "📝 Entry":
         if submitted:
             final_cat = category if category.strip() != "" else "Others"
             
-            if t_type == "Expense" and is_split:
-                if amt1 > 0:
-                    add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, final_cat, remark)
-                if amt2 > 0:
-                    add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, final_cat, remark)
-            
-            elif t_type == "Custodial Expense":
-                add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
-                add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
-            
-            elif t_type == "Custodial In":
-                add_transaction(tx_date, amt, f"{desc} (Custodial)", "Income", None, account_map[bank_acc], final_cat, f"Real deposit for {cust_acc}")
-                add_transaction(tx_date, amt, f"{desc} (Virtual)", "Income", None, account_map[cust_acc], final_cat, f"Virtual addition via {bank_acc}")
-                
+            # --- MANDATORY DESCRIPTION VALIDATION FOR LOAN ---
+            if t_type == "Increase Loan" and desc.strip() == "":
+                st.error("❌ Details (Description) are MANDATORY when increasing a loan amount.")
+            elif t_type == "Increase Loan" and not t_acc:
+                st.error("❌ No loan account selected.")
             else:
-                f_id = account_map.get(f_acc) if 'f_acc' in locals() and f_acc else None
-                t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
-                add_transaction(tx_date, amt, desc, t_type, f_id, t_id, final_cat, remark)
-            
-            st.success("Transaction Saved!")
-            clear_cache()
+                # --- PROCESS TRANSACTION ---
+                if t_type == "Expense" and is_split:
+                    if amt1 > 0:
+                        add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, final_cat, remark)
+                    if amt2 > 0:
+                        add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, final_cat, remark)
+                
+                elif t_type == "Custodial Expense":
+                    add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
+                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
+                
+                elif t_type == "Custodial In":
+                    add_transaction(tx_date, amt, f"{desc} (Custodial)", "Income", None, account_map[bank_acc], final_cat, f"Real deposit for {cust_acc}")
+                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Income", None, account_map[cust_acc], final_cat, f"Virtual addition via {bank_acc}")
+                    
+                elif t_type == "Increase Loan":
+                    add_transaction(tx_date, amt, desc, t_type, None, account_map[t_acc], final_cat, remark)
+                    
+                else:
+                    f_id = account_map.get(f_acc) if 'f_acc' in locals() and f_acc else None
+                    t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
+                    add_transaction(tx_date, amt, desc, t_type, f_id, t_id, final_cat, remark)
+                
+                st.success("Transaction Saved!")
+                clear_cache()
 
 # --- MENU: GOALS ---
 elif menu == "🎯 Goals":
