@@ -96,7 +96,7 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-# --- THE NEW STATE-TRACKING SAVE FUNCTION ---
+# --- BULLETPROOF STATE-TRACKING SAVE FUNCTION ---
 def apply_editor_changes(table_name, original_df, editor_key):
     changes = st.session_state[editor_key]
     
@@ -110,18 +110,27 @@ def apply_editor_changes(table_name, original_df, editor_key):
         idx = int(idx_str)
         row_id = original_df.iloc[idx]['id']
         
+        # FIX: Remove Streamlit's hidden index if it snuck in
+        edits.pop('_index', None)
+        
         # Safely convert dates to text for database saving
         if 'goal_date' in edits:
             edits['goal_date'] = str(edits['goal_date']) if edits['goal_date'] else None
             
-        supabase.table(table_name).update(edits).eq('id', row_id).execute()
+        if edits:
+            supabase.table(table_name).update(edits).eq('id', row_id).execute()
         
     # 3. PROCESS NEW ADDITIONS
     for new_row in changes.get("added_rows", []):
+        
+        # FIX: Strip out Streamlit's hidden variables to prevent Supabase crashes
+        new_row.pop('_index', None) 
+        new_row.pop('id', None) 
+        
         if not new_row.get('name') or str(new_row.get('name')).strip() == "":
             continue # Skip accidentally created blank rows entirely
             
-        # Provide safe default values for databases to prevent crashes
+        # Provide safe default values
         if table_name == 'accounts':
             new_row.setdefault('balance', 0.0)
             new_row.setdefault('currency', 'SGD')
@@ -468,11 +477,11 @@ elif menu == "⚙️ Settings":
     st.write("### 🏷️ Edit Categories")
     df_cats = get_categories()
     
-    # We pass the dataframe completely WITHOUT the 'id' column to the frontend table
     if not df_cats.empty:
+        # FIX: Added `_v2` to force Streamlit to wipe its cache and actually drop the ID column visually
         st.data_editor(
             df_cats[['name', 'type', 'budget_limit']], 
-            key="cat_editor",
+            key="cat_editor_v2", 
             num_rows="dynamic",
             hide_index=True, 
             column_config={
@@ -481,8 +490,7 @@ elif menu == "⚙️ Settings":
             }
         )
         if st.button("💾 Save Categories"):
-            # The tracking function applies edits secretly based on Streamlit's session state
-            apply_editor_changes('categories', df_cats, 'cat_editor')
+            apply_editor_changes('categories', df_cats, 'cat_editor_v2')
             st.success("Categories Updated!")
             st.rerun()
 
@@ -492,16 +500,16 @@ elif menu == "⚙️ Settings":
     df_all_accounts = get_accounts(show_inactive=True)
     
     if not df_all_accounts.empty:
-        # Notice how 'id' is completely missing from this list
         cols_to_edit = [
             'name', 'type', 'balance', 'currency', 'manual_exchange_rate',
             'goal_amount', 'goal_date', 'include_net_worth', 'is_liquid_asset',
             'sort_order', 'is_active', 'remark'
         ]
         
+        # FIX: Added `_v2` to force Streamlit to wipe its cache and actually drop the ID column visually
         st.data_editor(
             df_all_accounts[cols_to_edit], 
-            key="account_editor",
+            key="account_editor_v2",
             num_rows="dynamic",
             hide_index=True, 
             column_config={
@@ -513,6 +521,6 @@ elif menu == "⚙️ Settings":
             }
         )
         if st.button("💾 Save Accounts"):
-            apply_editor_changes('accounts', df_all_accounts, 'account_editor')
+            apply_editor_changes('accounts', df_all_accounts, 'account_editor_v2')
             st.success("Accounts Updated!")
             st.rerun()
