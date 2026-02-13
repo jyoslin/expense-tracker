@@ -70,7 +70,7 @@ def get_accounts(show_inactive=False):
     if not show_inactive:
         df = df[df['is_active'] == True]
         
-    # FIX: Implement hierarchical sorting (Type -> Sort Order -> Name)
+    # Hierarchical sorting (Type -> Sort Order -> Name)
     type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
     df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
     
@@ -253,7 +253,6 @@ if menu == "📊 Overview":
             
             st.divider()
             
-            # FIX: Moved Delete function to Overview Tab, right below the statement
             st.write("### 🗑️ Delete / Reverse Transaction")
             st.info("To edit a mistake, delete its ID here to restore your balances, then re-enter it correctly.")
             
@@ -268,7 +267,7 @@ if menu == "📊 Overview":
                         success = delete_transaction(del_id)
                         if success:
                             st.success(f"Transaction {del_id} deleted and balances restored!")
-                            st.rerun() # Refreshes the view automatically
+                            st.rerun()
                         else:
                             st.error("Transaction ID not found.")
                     else:
@@ -345,9 +344,19 @@ elif menu == "📝 Entry":
                 t_acc = st.selectbox("Select Loan Account", loan_opts)
             amt = c2.number_input("Amount to Add to Loan", min_value=0.01)
 
-        # Categories
-        cat_type = "Income" if t_type in ["Income", "Custodial In"] else "Expense"
-        cat_options = get_categories(cat_type)['name'].tolist()
+        # Categories filter logic updated to include "Fund"
+        df_cats_full = get_categories()
+        if df_cats_full.empty:
+            cat_options = []
+        else:
+            if t_type in ["Income", "Custodial In"]:
+                cat_options = df_cats_full[df_cats_full['type'] == 'Income']['name'].tolist()
+            elif t_type == "Transfer":
+                cat_options = df_cats_full['name'].tolist() # Allow any category for transfers
+            else:
+                # Show both Expense and Fund categories for Expenses and Loans
+                cat_options = df_cats_full[df_cats_full['type'].isin(['Expense', 'Fund'])]['name'].tolist()
+                
         category = st.selectbox("Category", [""] + cat_options)
         
         desc = st.text_input("Description")
@@ -463,7 +472,7 @@ elif menu == "⚙️ Settings":
             hide_index=True, 
             column_config={
                 "id": None,  
-                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
+                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Fund"]), # Added Fund option
                 "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01) 
             }
         )
