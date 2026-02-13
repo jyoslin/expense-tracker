@@ -42,7 +42,6 @@ def get_accounts(show_inactive=False):
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
-    # All columns we expect in the DB
     cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 
             'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark', 
             'currency', 'manual_exchange_rate']
@@ -85,7 +84,6 @@ def save_bulk_editor(table_name, df_edited):
     records = df_edited.to_dict('records')
     for row in records:
         if table_name == 'accounts':
-            # Use .get() to prevent crashes if columns are hidden/missing
             safe_goal = row.get('goal_amount', 0)
             if pd.isna(safe_goal): safe_goal = 0
             
@@ -106,7 +104,6 @@ def save_bulk_editor(table_name, df_edited):
                 "goal_amount": safe_goal,
                 "goal_date": row.get('goal_date')
             }
-            # Clean up None/NaN values for Supabase
             if pd.isna(data['goal_date']): data['goal_date'] = None
             
         elif table_name == 'categories':
@@ -148,10 +145,13 @@ account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
+# --- NEW SIDEBAR NAVIGATION ---
+st.sidebar.title("Navigation")
+menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
-# --- TAB 1: OVERVIEW ---
-with tab1:
+# --- MENU: OVERVIEW ---
+if menu == "📊 Overview":
+    st.header("📊 Overview")
     if not df_active.empty:
         df_calc = df_active.copy()
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
@@ -195,9 +195,9 @@ with tab1:
         else:
             st.info("No recent transactions found.")
 
-# --- TAB 2: ENTRY ---
-with tab2:
-    st.subheader("New Transaction")
+# --- MENU: ENTRY ---
+elif menu == "📝 Entry":
+    st.header("📝 New Transaction")
     
     t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In"], horizontal=True)
     
@@ -274,18 +274,20 @@ with tab2:
             st.success("Transaction Saved!")
             clear_cache()
 
-# --- TAB 3: GOALS ---
-with tab3:
-    st.subheader("🎯 Sinking Funds Dashboard")
+# --- MENU: GOALS ---
+elif menu == "🎯 Goals":
+    st.header("🎯 Sinking Funds Dashboard")
     goals = df_active[df_active['type'] == 'Sinking Fund']
     if not goals.empty:
         for i, (index, row) in enumerate(goals.iterrows()):
             st.write(f"**{row['name']}** - ${row['balance']:,.2f} / ${row['goal_amount']:,.2f}")
             st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
+    else:
+        st.info("No Sinking Funds created yet.")
 
-# --- TAB 4: SCHEDULE ---
-with tab4:
-    st.subheader("Manage Future Payments")
+# --- MENU: SCHEDULE ---
+elif menu == "📅 Schedule":
+    st.header("📅 Manage Future Payments")
     
     with st.expander("➕ Add Schedule", expanded=False):
         with st.form("sch_form"):
@@ -331,20 +333,21 @@ with tab4:
                 supabase.table('schedule').delete().eq("id", del_id).execute()
                 st.rerun()
 
-# --- TAB 5: SETTINGS ---
-with tab5:
-    st.subheader("🔧 Configuration")
+# --- MENU: SETTINGS ---
+elif menu == "⚙️ Settings":
+    st.header("🔧 Configuration")
     
     st.write("### 🏷️ Edit Categories")
-    st.caption("Click '+' row to add. Leave ID blank for new rows.")
+    st.caption("Click '+' row to add. ID is now hidden automatically.")
     df_cats = get_categories()
     if not df_cats.empty:
         edited_cats = st.data_editor(
             df_cats[['id', 'name', 'type', 'budget_limit']], 
             key="cat_editor",
             num_rows="dynamic",
-            disabled=['id'],
+            hide_index=True, # HIDES PANDAS INDEX COLUMN
             column_config={
+                "id": None,  # COMPLETELY HIDES ID FROM THE USER
                 "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
                 "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f")
             }
@@ -356,10 +359,9 @@ with tab5:
     st.divider()
 
     st.write("### 🏦 Edit Accounts")
-    # FIX: Show ALL columns so the save function has access to 'remark', 'goals', etc.
+    st.caption("Click '+' row to add. ID is now hidden automatically.")
     df_all_accounts = get_accounts(show_inactive=True)
     if not df_all_accounts.empty:
-        # Full column list for editing
         cols_to_edit = [
             'id', 'name', 'type', 'balance', 'currency', 'manual_exchange_rate',
             'goal_amount', 'goal_date', 'include_net_worth', 'is_liquid_asset',
@@ -370,8 +372,9 @@ with tab5:
             df_all_accounts[cols_to_edit], 
             key="account_editor",
             num_rows="dynamic",
-            disabled=['id'],
+            hide_index=True, # HIDES PANDAS INDEX COLUMN
             column_config={
+                "id": None,  # COMPLETELY HIDES ID FROM THE USER
                 "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
