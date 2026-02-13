@@ -52,7 +52,7 @@ def get_accounts(show_inactive=False):
         'sort_order': 99, 'is_active': True, 'remark': "", 
         'currency': "SGD", 'manual_exchange_rate': 1.0, 
         'include_net_worth': True, 'is_liquid_asset': True,
-        'goal_amount': 0, 'goal_date': None
+        'goal_amount': 0.0, 'goal_date': None # Fixed: 0.0 forces float/decimal handling
     }
     for col, val in defaults.items():
         if col not in df.columns: df[col] = val
@@ -84,8 +84,8 @@ def save_bulk_editor(table_name, df_edited):
     records = df_edited.to_dict('records')
     for row in records:
         if table_name == 'accounts':
-            safe_goal = row.get('goal_amount', 0)
-            if pd.isna(safe_goal): safe_goal = 0
+            safe_goal = row.get('goal_amount', 0.0)
+            if pd.isna(safe_goal): safe_goal = 0.0
             
             safe_rate = row.get('manual_exchange_rate', 1.0)
             if pd.isna(safe_rate): safe_rate = 1.0
@@ -107,8 +107,8 @@ def save_bulk_editor(table_name, df_edited):
             if pd.isna(data['goal_date']): data['goal_date'] = None
             
         elif table_name == 'categories':
-             safe_limit = row.get('budget_limit', 0)
-             if pd.isna(safe_limit): safe_limit = 0
+             safe_limit = row.get('budget_limit', 0.0)
+             if pd.isna(safe_limit): safe_limit = 0.0
              data = {
                  "name": row['name'], 
                  "type": row['type'], 
@@ -145,7 +145,7 @@ account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
-# --- NEW SIDEBAR NAVIGATION ---
+# --- SIDEBAR NAVIGATION ---
 st.sidebar.title("Navigation")
 menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
@@ -233,18 +233,27 @@ elif menu == "📝 Entry":
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts)
             amt = c2.number_input("Total Amount", min_value=0.01)
 
+        elif t_type == "Custodial In":
+            st.info("🔼 Deposits Virtual money to Custodial AND Actual money to Bank")
+            c_a, c_b = st.columns(2)
+            cust_opts = df_active[df_active['type']=='Custodial']['name']
+            bank_opts = df_active[df_active['type']=='Bank']['name']
+            cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts)
+            bank_acc = c_b.selectbox("Deposit to Bank (Actual)", bank_opts)
+            amt = c2.number_input("Total Amount", min_value=0.01)
+
         elif t_type in ["Income", "Refund"]:
             t_acc = st.selectbox("Deposit To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
-        elif t_type in ["Transfer", "Custodial In"]:
+        elif t_type == "Transfer":
             c_a, c_b = st.columns(2)
             f_acc = c_a.selectbox("From", non_loan_accounts)
             t_acc = c_b.selectbox("To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
         # Categories
-        cat_type = "Income" if t_type == "Income" else "Expense"
+        cat_type = "Income" if t_type in ["Income", "Custodial In"] else "Expense"
         cat_options = get_categories(cat_type)['name'].tolist()
         category = st.selectbox("Category", [""] + cat_options)
         
@@ -265,6 +274,10 @@ elif menu == "📝 Entry":
             elif t_type == "Custodial Expense":
                 add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
                 add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
+            
+            elif t_type == "Custodial In":
+                add_transaction(tx_date, amt, f"{desc} (Custodial)", "Income", None, account_map[bank_acc], final_cat, f"Real deposit for {cust_acc}")
+                add_transaction(tx_date, amt, f"{desc} (Virtual)", "Income", None, account_map[cust_acc], final_cat, f"Virtual addition via {bank_acc}")
                 
             else:
                 f_id = account_map.get(f_acc) if 'f_acc' in locals() and f_acc else None
@@ -345,11 +358,11 @@ elif menu == "⚙️ Settings":
             df_cats[['id', 'name', 'type', 'budget_limit']], 
             key="cat_editor",
             num_rows="dynamic",
-            hide_index=True, # HIDES PANDAS INDEX COLUMN
+            hide_index=True, 
             column_config={
-                "id": None,  # COMPLETELY HIDES ID FROM THE USER
+                "id": None,  
                 "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
-                "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f")
+                "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01) # Added decimal support here too
             }
         )
         if st.button("💾 Save Categories"):
@@ -372,12 +385,13 @@ elif menu == "⚙️ Settings":
             df_all_accounts[cols_to_edit], 
             key="account_editor",
             num_rows="dynamic",
-            hide_index=True, # HIDES PANDAS INDEX COLUMN
+            hide_index=True, 
             column_config={
-                "id": None,  # COMPLETELY HIDES ID FROM THE USER
+                "id": None,  
                 "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
+                "goal_amount": st.column_config.NumberColumn("Goal Amount", format="%.2f", step=0.01), # Added explicit decimal formatting for accounts
                 "manual_exchange_rate": st.column_config.NumberColumn("Rate", format="%.4f"),
             }
         )
