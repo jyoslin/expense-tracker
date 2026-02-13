@@ -48,7 +48,6 @@ def get_accounts(show_inactive=False):
             
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # 1. Fill missing columns
     defaults = {
         'sort_order': 99, 'is_active': True, 'remark': "", 
         'currency': "SGD", 'manual_exchange_rate': 1.0, 
@@ -58,18 +57,14 @@ def get_accounts(show_inactive=False):
     for col, val in defaults.items():
         if col not in df.columns: df[col] = val
         
-    # 2. ENFORCE STRICT DATA TYPES (This prevents the Streamlit crash!)
     df['balance'] = pd.to_numeric(df['balance'], errors='coerce').fillna(0.0)
     df['goal_amount'] = pd.to_numeric(df['goal_amount'], errors='coerce').fillna(0.0)
     df['manual_exchange_rate'] = pd.to_numeric(df['manual_exchange_rate'], errors='coerce').fillna(1.0)
     df['sort_order'] = pd.to_numeric(df['sort_order'], errors='coerce').fillna(99).astype(int)
     
-    # Convert strings to booleans safely
     df['is_active'] = df['is_active'].fillna(True).astype(bool)
     df['include_net_worth'] = df['include_net_worth'].fillna(True).astype(bool)
     df['is_liquid_asset'] = df['is_liquid_asset'].fillna(True).astype(bool)
-    
-    # Convert strings to actual Date objects
     df['goal_date'] = pd.to_datetime(df['goal_date'], errors='coerce').dt.date
     
     if not show_inactive:
@@ -89,9 +84,7 @@ def get_categories(type_filter=None):
     if 'budget_limit' not in df.columns: 
         df['budget_limit'] = 0.0
     
-    # Enforce float type for limits
     df['budget_limit'] = pd.to_numeric(df['budget_limit'], errors='coerce').fillna(0.0)
-    
     return df.sort_values('name')
 
 def update_balance(account_id, amount_change):
@@ -103,41 +96,33 @@ def update_balance(account_id, amount_change):
 def save_bulk_editor(table_name, df_edited):
     records = df_edited.to_dict('records')
     for row in records:
+        # 🚨 CRITICAL FIX: Deep clean the row, converting ANY pandas NaN to standard Python None
+        clean_row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        
         if table_name == 'accounts':
-            safe_goal = row.get('goal_amount', 0.0)
-            if pd.isna(safe_goal): safe_goal = 0.0
-            
-            safe_rate = row.get('manual_exchange_rate', 1.0)
-            if pd.isna(safe_rate): safe_rate = 1.0
-            
             data = {
-                "name": row.get('name'), 
-                "balance": row.get('balance'), 
-                "type": row.get('type'),
-                "currency": row.get('currency', 'SGD'), 
-                "manual_exchange_rate": safe_rate,
-                "remark": row.get('remark', ''), 
-                "is_active": row.get('is_active', True), 
-                "sort_order": row.get('sort_order', 99),
-                "include_net_worth": row.get('include_net_worth', True), 
-                "is_liquid_asset": row.get('is_liquid_asset', True),
-                "goal_amount": safe_goal,
-                "goal_date": row.get('goal_date')
+                "name": clean_row.get('name'), 
+                "balance": clean_row.get('balance') or 0.0, 
+                "type": clean_row.get('type'),
+                "currency": clean_row.get('currency') or 'SGD', 
+                "manual_exchange_rate": clean_row.get('manual_exchange_rate') or 1.0,
+                "remark": clean_row.get('remark') or '', 
+                "is_active": clean_row.get('is_active') if clean_row.get('is_active') is not None else True, 
+                "sort_order": clean_row.get('sort_order') or 99,
+                "include_net_worth": clean_row.get('include_net_worth') if clean_row.get('include_net_worth') is not None else True, 
+                "is_liquid_asset": clean_row.get('is_liquid_asset') if clean_row.get('is_liquid_asset') is not None else True,
+                "goal_amount": clean_row.get('goal_amount') or 0.0,
+                "goal_date": str(clean_row.get('goal_date')) if clean_row.get('goal_date') else None
             }
-            if pd.isna(data['goal_date']): data['goal_date'] = None
-            else: data['goal_date'] = str(data['goal_date']) # Convert back to string for Supabase
-            
         elif table_name == 'categories':
-             safe_limit = row.get('budget_limit', 0.0)
-             if pd.isna(safe_limit): safe_limit = 0.0
              data = {
-                 "name": row['name'], 
-                 "type": row['type'], 
-                 "budget_limit": safe_limit
+                 "name": clean_row.get('name'), 
+                 "type": clean_row.get('type'), 
+                 "budget_limit": clean_row.get('budget_limit') or 0.0
              }
         
-        row_id = row.get('id')
-        if row_id and pd.notna(row_id):
+        row_id = clean_row.get('id')
+        if row_id is not None:
             supabase.table(table_name).update(data).eq("id", row_id).execute()
         else:
             supabase.table(table_name).insert(data).execute()
@@ -383,7 +368,7 @@ elif menu == "⚙️ Settings":
             column_config={
                 "id": None,  
                 "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
-                "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01)
+                "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01) 
             }
         )
         if st.button("💾 Save Categories"):
@@ -412,7 +397,7 @@ elif menu == "⚙️ Settings":
                 "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
-                "goal_amount": st.column_config.NumberColumn("Goal Amount", format="%.2f", step=0.01),
+                "goal_amount": st.column_config.NumberColumn("Goal Amount", format="%.2f", step=0.01), 
                 "manual_exchange_rate": st.column_config.NumberColumn("Rate", format="%.4f"),
             }
         )
