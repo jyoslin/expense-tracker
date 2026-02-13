@@ -73,7 +73,6 @@ def get_accounts(show_inactive=False):
     type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
     df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
     
-    # FIX: Added .reset_index(drop=True) so Streamlit data_editor allows new rows seamlessly
     return df.sort_values(by=['type', 'sort_order', 'name']).reset_index(drop=True)
 
 @st.cache_data(ttl=3600)
@@ -89,8 +88,6 @@ def get_categories(type_filter=None):
         df['budget_limit'] = 0.0
     
     df['budget_limit'] = pd.to_numeric(df['budget_limit'], errors='coerce').fillna(0.0)
-    
-    # FIX: Added .reset_index(drop=True) 
     return df.sort_values('name').reset_index(drop=True)
 
 def update_balance(account_id, amount_change):
@@ -102,30 +99,24 @@ def update_balance(account_id, amount_change):
 def apply_editor_changes(table_name, original_df, editor_key):
     changes = st.session_state[editor_key]
     
-    # 1. PROCESS DELETIONS
     for idx in changes.get("deleted_rows", []):
         row_id = original_df.iloc[idx]['id']
         supabase.table(table_name).delete().eq('id', row_id).execute()
         
-    # 2. PROCESS EDITS TO EXISTING ROWS
     for idx_str, edits in changes.get("edited_rows", {}).items():
         idx = int(idx_str)
         row_id = original_df.iloc[idx]['id']
         
         edits.pop('_index', None)
-        
         if 'goal_date' in edits:
             edits['goal_date'] = str(edits['goal_date']) if edits['goal_date'] else None
             
         if edits:
             supabase.table(table_name).update(edits).eq('id', row_id).execute()
         
-    # 3. PROCESS NEW ADDITIONS
     for new_row in changes.get("added_rows", []):
-        
         new_row.pop('_index', None) 
         new_row.pop('id', None) 
-        
         if not new_row.get('name') or str(new_row.get('name')).strip() == "":
             continue 
             
@@ -146,7 +137,6 @@ def apply_editor_changes(table_name, original_df, editor_key):
             new_row.setdefault('type', 'Expense')
             
         supabase.table(table_name).insert(new_row).execute()
-        
     clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
@@ -156,8 +146,9 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
         "remark": remark
     }).execute()
 
-    if type == "Expense": update_balance(from_acc_id, -amount)
-    elif type == "Income": update_balance(to_acc_id, amount)
+    # Supports the new Virtual Expense and Virtual Funding logic safely without double-counting later
+    if type in ["Expense", "Virtual Expense"]: update_balance(from_acc_id, -amount)
+    elif type in ["Income", "Virtual Funding"]: update_balance(to_acc_id, amount)
     elif type == "Increase Loan": update_balance(to_acc_id, -amount) 
     elif type == "Transfer":
         if from_acc_id: update_balance(from_acc_id, -amount)
@@ -174,12 +165,9 @@ def delete_transaction(tx_id):
     amt = float(tx['amount'])
     t_type = tx['type']
     
-    if t_type == "Expense": 
-        update_balance(tx['from_account_id'], amt) 
-    elif t_type == "Income": 
-        update_balance(tx['to_account_id'], -amt) 
-    elif t_type == "Increase Loan": 
-        update_balance(tx['to_account_id'], amt) 
+    if t_type in ["Expense", "Virtual Expense"]: update_balance(tx['from_account_id'], amt) 
+    elif t_type in ["Income", "Virtual Funding"]: update_balance(tx['to_account_id'], -amt) 
+    elif t_type == "Increase Loan": update_balance(tx['to_account_id'], amt) 
     elif t_type == "Transfer":
         if tx['from_account_id']: update_balance(tx['from_account_id'], amt)
         if tx['to_account_id']: update_balance(tx['to_account_id'], -amt)
@@ -206,14 +194,26 @@ if menu == "📊 Overview":
     if not df_active.empty:
         df_calc = df_active.copy()
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
+        
+        # 1. Net Worth (All tracked assets & liabilities)
         net_worth = df_calc[df_calc['include_net_worth'] == True]['sgd_value'].sum()
-        liquid = df_calc[df_calc['is_liquid_asset'] == True]['sgd_value'].sum()
+        
+        # 2. Liquid Assets (Net Worth MINUS Custodial)
+        custodial = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Custodial')]['sgd_value'].sum()
+        liquid = net_worth - custodial
+        
+        # 3. Discretionary Cash (Liquid MINUS Sinking Funds)
+        sinking_funds = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Sinking Fund')]['sgd_value'].sum()
+        discretionary = liquid - sinking_funds
+        
     else:
-        net_worth, liquid = 0, 0
+        net_worth, liquid, discretionary = 0, 0, 0
     
-    c1, c2 = st.columns(2)
-    c1.metric("Net Worth (SGD)", f"${net_worth:,.2f}") 
-    c2.metric("Liquid Assets (SGD)", f"${liquid:,.2f}")
+    # NEW: 3-Tier Dashboard
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Net Worth (SGD)", f"${net_worth:,.2f}", help="Total wealth including all assets minus liabilities.") 
+    c2.metric("Liquid Assets (SGD)", f"${liquid:,.2f}", help="Net worth MINUS Custodial accounts (money that is actually yours).")
+    c3.metric("Discretionary Cash (SGD)", f"${discretionary:,.2f}", help="Liquid Assets MINUS Sinking Funds. This is free cash you can spend today with zero guilt.")
     
     st.divider()
 
@@ -253,7 +253,7 @@ if menu == "📊 Overview":
                 if row['type'] == 'Transfer':
                     amt = amt if is_inflow else -amt
                     desc = f"Transfer: {desc}"
-                elif row['type'] == 'Expense':
+                elif row['type'] in ['Expense', 'Virtual Expense']:
                     amt = -amt
                 elif row['type'] == 'Increase Loan':
                     amt = -amt 
@@ -295,7 +295,8 @@ elif menu == "📝 Entry":
     
     msg_container = st.empty() 
     
-    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan"], horizontal=True)
+    # NEW: Added Sinking Fund Expense
+    t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan", "Sinking Fund Expense"], horizontal=True)
     
     is_split = False
     if t_type == "Expense":
@@ -335,6 +336,15 @@ elif menu == "📝 Entry":
             bank_opts = df_active[df_active['type']=='Bank']['name']
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts)
             bank_acc = c_b.selectbox("Deposit to Bank (Actual)", bank_opts)
+            amt = c2.number_input("Total Amount", min_value=0.01)
+
+        elif t_type == "Sinking Fund Expense":
+            st.info("🛍️ Pay for your goal using your real Bank money, and empty out the virtual Sinking Fund envelope.")
+            c_a, c_b = st.columns(2)
+            sf_opts = df_active[df_active['type']=='Sinking Fund']['name']
+            bank_opts = df_active[df_active['type']=='Bank']['name']
+            sf_acc = c_a.selectbox("Deduct from Virtual Envelope", sf_opts)
+            bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts)
             amt = c2.number_input("Total Amount", min_value=0.01)
 
         elif t_type == "Income":
@@ -391,11 +401,15 @@ elif menu == "📝 Entry":
                 
                 elif t_type == "Custodial Expense":
                     add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
-                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
+                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Virtual Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
+                
+                elif t_type == "Sinking Fund Expense":
+                    add_transaction(tx_date, amt, f"{desc} (Actual Payment)", "Expense", account_map[bank_acc], None, final_cat, f"Paid for {sf_acc} goal")
+                    add_transaction(tx_date, amt, f"{desc} (Virtual Envelope Deduction)", "Virtual Expense", account_map[sf_acc], None, final_cat, f"Deducted from envelope")
                 
                 elif t_type == "Custodial In":
                     add_transaction(tx_date, amt, f"{desc} (Custodial)", "Income", None, account_map[bank_acc], final_cat, f"Real deposit for {cust_acc}")
-                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Income", None, account_map[cust_acc], final_cat, f"Virtual addition via {bank_acc}")
+                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Virtual Funding", None, account_map[cust_acc], final_cat, f"Virtual addition via {bank_acc}")
                     
                 elif t_type == "Increase Loan":
                     add_transaction(tx_date, amt, desc, t_type, None, account_map[t_acc], final_cat, remark)
@@ -412,13 +426,56 @@ elif menu == "📝 Entry":
 # --- MENU: GOALS ---
 elif menu == "🎯 Goals":
     st.header("🎯 Sinking Funds Dashboard")
+    st.write("Virtually set aside money for future goals without it leaving your bank account. This safely reduces your Discretionary Cash on the Overview tab!")
+    
     goals = df_active[df_active['type'] == 'Sinking Fund']
     if not goals.empty:
         for i, (index, row) in enumerate(goals.iterrows()):
-            st.write(f"**{row['name']}** - ${row['balance']:,.2f} / ${row['goal_amount']:,.2f}")
-            st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
+            with st.container(border=True):
+                st.subheader(f"🏷️ {row['name']}")
+                
+                # Metrics Display
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Current Saved", f"${row['balance']:,.2f}")
+                col2.metric("Goal Target", f"${row['goal_amount']:,.2f}")
+                goal_str = row['goal_date'].strftime("%d %b %Y") if row['goal_date'] else "No Date Set"
+                col3.metric("Target Date", goal_str)
+                
+                st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
+                
+                # NEW: The Automation Calculator
+                with st.expander("⚙️ Automate Monthly Funding"):
+                    term = st.number_input("Term (Total Months to Save)", min_value=1, value=12, key=f"term_{row['id']}")
+                    
+                    # Core Math
+                    today = date.today()
+                    if row['goal_date']:
+                        months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
+                        months_left = max(0, months_left) # Prevent negative numbers if date is past
+                    else:
+                        months_left = term # Fallback if they didn't set a date in Settings
+                        
+                    months_elapsed = max(0, term - months_left)
+                    monthly_contrib = row['goal_amount'] / term if term > 0 else 0
+                    expected_bal = monthly_contrib * months_elapsed
+                    
+                    # Print mini report
+                    st.write(f"**Monthly Requirement:** ${monthly_contrib:,.2f}")
+                    st.write(f"**Timeline:** {months_elapsed} months elapsed out of {term}")
+                    st.write(f"**Expected Balance Today:** ${expected_bal:,.2f}")
+                    
+                    if row['balance'] >= expected_bal and row['balance'] > 0:
+                        st.success("🟢 You are on track or ahead of schedule!")
+                    elif row['balance'] < expected_bal:
+                        st.warning(f"🔴 You are currently behind by ${expected_bal - row['balance']:,.2f}")
+                        
+                    if st.button(f"➕ Add Virtual Funding (${monthly_contrib:,.2f})", key=f"btn_{row['id']}"):
+                        add_transaction(today, monthly_contrib, f"Monthly Envelope Funding: {row['name']}", "Virtual Funding", None, row['id'], "Fund", "Automated envelope funding")
+                        st.success(f"Added ${monthly_contrib:,.2f} to {row['name']}!")
+                        clear_cache()
+                        st.rerun()
     else:
-        st.info("No Sinking Funds created yet.")
+        st.info("No Sinking Funds created yet. Go to Settings to add one!")
 
 # --- MENU: SCHEDULE ---
 elif menu == "📅 Schedule":
@@ -478,7 +535,7 @@ elif menu == "⚙️ Settings":
     if not df_cats.empty:
         st.data_editor(
             df_cats[['name', 'type', 'budget_limit']], 
-            key="cat_editor_v3",  # Updated to clear old cache again
+            key="cat_editor_v3", 
             num_rows="dynamic",
             hide_index=True, 
             column_config={
@@ -505,7 +562,7 @@ elif menu == "⚙️ Settings":
         
         st.data_editor(
             df_all_accounts[cols_to_edit], 
-            key="account_editor_v3", # Updated to clear old cache again
+            key="account_editor_v3", 
             num_rows="dynamic",
             hide_index=True, 
             column_config={
