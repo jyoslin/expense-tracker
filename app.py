@@ -73,7 +73,8 @@ def get_accounts(show_inactive=False):
     type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
     df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
     
-    return df.sort_values(by=['type', 'sort_order', 'name'])
+    # FIX: Added .reset_index(drop=True) so Streamlit data_editor allows new rows seamlessly
+    return df.sort_values(by=['type', 'sort_order', 'name']).reset_index(drop=True)
 
 @st.cache_data(ttl=3600)
 def get_categories(type_filter=None):
@@ -88,7 +89,9 @@ def get_categories(type_filter=None):
         df['budget_limit'] = 0.0
     
     df['budget_limit'] = pd.to_numeric(df['budget_limit'], errors='coerce').fillna(0.0)
-    return df.sort_values('name')
+    
+    # FIX: Added .reset_index(drop=True) 
+    return df.sort_values('name').reset_index(drop=True)
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
@@ -96,7 +99,6 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-# --- BULLETPROOF STATE-TRACKING SAVE FUNCTION ---
 def apply_editor_changes(table_name, original_df, editor_key):
     changes = st.session_state[editor_key]
     
@@ -110,10 +112,8 @@ def apply_editor_changes(table_name, original_df, editor_key):
         idx = int(idx_str)
         row_id = original_df.iloc[idx]['id']
         
-        # FIX: Remove Streamlit's hidden index if it snuck in
         edits.pop('_index', None)
         
-        # Safely convert dates to text for database saving
         if 'goal_date' in edits:
             edits['goal_date'] = str(edits['goal_date']) if edits['goal_date'] else None
             
@@ -123,14 +123,12 @@ def apply_editor_changes(table_name, original_df, editor_key):
     # 3. PROCESS NEW ADDITIONS
     for new_row in changes.get("added_rows", []):
         
-        # FIX: Strip out Streamlit's hidden variables to prevent Supabase crashes
         new_row.pop('_index', None) 
         new_row.pop('id', None) 
         
         if not new_row.get('name') or str(new_row.get('name')).strip() == "":
-            continue # Skip accidentally created blank rows entirely
+            continue 
             
-        # Provide safe default values
         if table_name == 'accounts':
             new_row.setdefault('balance', 0.0)
             new_row.setdefault('currency', 'SGD')
@@ -478,10 +476,9 @@ elif menu == "⚙️ Settings":
     df_cats = get_categories()
     
     if not df_cats.empty:
-        # FIX: Added `_v2` to force Streamlit to wipe its cache and actually drop the ID column visually
         st.data_editor(
             df_cats[['name', 'type', 'budget_limit']], 
-            key="cat_editor_v2", 
+            key="cat_editor_v3",  # Updated to clear old cache again
             num_rows="dynamic",
             hide_index=True, 
             column_config={
@@ -490,7 +487,7 @@ elif menu == "⚙️ Settings":
             }
         )
         if st.button("💾 Save Categories"):
-            apply_editor_changes('categories', df_cats, 'cat_editor_v2')
+            apply_editor_changes('categories', df_cats, 'cat_editor_v3')
             st.success("Categories Updated!")
             st.rerun()
 
@@ -506,10 +503,9 @@ elif menu == "⚙️ Settings":
             'sort_order', 'is_active', 'remark'
         ]
         
-        # FIX: Added `_v2` to force Streamlit to wipe its cache and actually drop the ID column visually
         st.data_editor(
             df_all_accounts[cols_to_edit], 
-            key="account_editor_v2",
+            key="account_editor_v3", # Updated to clear old cache again
             num_rows="dynamic",
             hide_index=True, 
             column_config={
@@ -521,6 +517,6 @@ elif menu == "⚙️ Settings":
             }
         )
         if st.button("💾 Save Accounts"):
-            apply_editor_changes('accounts', df_all_accounts, 'account_editor_v2')
+            apply_editor_changes('accounts', df_all_accounts, 'account_editor_v3')
             st.success("Accounts Updated!")
             st.rerun()
