@@ -42,14 +42,12 @@ def get_accounts(show_inactive=False):
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
-    # Define all expected columns
     cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 
             'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark', 
             'currency', 'manual_exchange_rate']
             
     if df.empty: return pd.DataFrame(columns=cols)
     
-    # Fill missing columns with defaults
     defaults = {
         'sort_order': 99, 'is_active': True, 'remark': "", 
         'currency': "SGD", 'manual_exchange_rate': 1.0, 
@@ -78,22 +76,16 @@ def get_categories(type_filter=None):
 
 def update_balance(account_id, amount_change):
     if not account_id: return 
-    # Get fresh balance
     current = supabase.table('accounts').select("balance").eq("id", account_id).execute().data[0]['balance']
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
 def save_bulk_editor(table_name, df_edited):
-    """Handles Bulk Updates & Inserts (Auto-ID)"""
     records = df_edited.to_dict('records')
-    
     for row in records:
-        # Sanitize Data
         if table_name == 'accounts':
-            # Default missing numerical values
             if pd.isna(row.get('goal_amount')): row['goal_amount'] = 0
             if pd.isna(row.get('manual_exchange_rate')): row['manual_exchange_rate'] = 1.0
-            
             data = {
                 "name": row['name'], "balance": row['balance'], "type": row['type'],
                 "currency": row['currency'], "manual_exchange_rate": row['manual_exchange_rate'],
@@ -106,14 +98,11 @@ def save_bulk_editor(table_name, df_edited):
                  "name": row['name'], "type": row['type'], "budget_limit": row['budget_limit']
              }
         
-        # LOGIC: If 'id' is missing or NaN, it's a NEW row -> INSERT
         row_id = row.get('id')
         if row_id and pd.notna(row_id):
             supabase.table(table_name).update(data).eq("id", row_id).execute()
         else:
-            # Insert (Supabase handles ID generation)
             supabase.table(table_name).insert(data).execute()
-    
     clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
@@ -138,12 +127,10 @@ account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
-# Tabs - Restored "Schedule" explicitly
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
 
 # --- TAB 1: OVERVIEW ---
 with tab1:
-    # Metrics
     if not df_active.empty:
         df_calc = df_active.copy()
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
@@ -158,13 +145,11 @@ with tab1:
     
     st.divider()
 
-    # ACCOUNT STATEMENT (Requested Feature)
     st.subheader("📜 Account Statement")
     selected_acc_name = st.selectbox("Select Account to View:", account_list, key="ledger_select")
     
     if selected_acc_name:
         sel_id = account_map[selected_acc_name]
-        # Fetch txs involving this account
         txs = supabase.table('transactions').select("*") \
             .or_(f"from_account_id.eq.{sel_id},to_account_id.eq.{sel_id}") \
             .order("date", desc=True).limit(50).execute().data
@@ -174,16 +159,13 @@ with tab1:
             view_data = []
             for _, row in df_tx.iterrows():
                 is_inflow = row['to_account_id'] == sel_id
-                
                 desc = row['description']
                 amt = row['amount']
-                
                 if row['type'] == 'Transfer':
                     amt = amt if is_inflow else -amt
                     desc = f"Transfer: {desc}"
                 elif row['type'] == 'Expense':
                     amt = -amt
-                
                 view_data.append({
                     "Date": row['date'], "Description": desc, "Amount": amt, 
                     "Category": row['category'], "Type": row['type']
@@ -196,22 +178,17 @@ with tab1:
 with tab2:
     st.subheader("New Transaction")
     
-    # 1. Select Type
     t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In"], horizontal=True)
     
-    # 2. Select Split (Only for Expense)
     is_split = False
     if t_type == "Expense":
-        # We put this OUTSIDE the form so it updates the UI immediately
         is_split = st.checkbox("🔀 Split Payment (Pay from 2 sources)")
     
     with st.form("entry_form"):
         c1, c2 = st.columns(2)
         tx_date = c1.date_input("Date", datetime.today())
         
-        # --- DYNAMIC FIELDS BASED ON TYPE ---
-        
-        # A. SPLIT EXPENSE
+        # Branching Logic
         if t_type == "Expense" and is_split:
             st.info("Split Payment: Amount 1 + Amount 2 = Total Expense")
             col_a, col_b = st.columns(2)
@@ -221,39 +198,35 @@ with tab2:
             with col_b:
                 acc2 = st.selectbox("Source 2", non_loan_accounts, key="src2")
                 amt2 = st.number_input("Amount 2", min_value=0.0, format="%.2f")
-
-        # B. NORMAL EXPENSE
+        
         elif t_type == "Expense":
             f_acc = st.selectbox("Paid From", non_loan_accounts)
             amt = c2.number_input("Amount", min_value=0.01)
 
-        # C. CUSTODIAL EXPENSE (Virtual + Real)
         elif t_type == "Custodial Expense":
             st.warning("🔻 Deducts from Virtual Custodial Account AND Actual Bank Account")
             c_a, c_b = st.columns(2)
             cust_opts = df_active[df_active['type']=='Custodial']['name']
             bank_opts = df_active[df_active['type']=='Bank']['name']
-            
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts)
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts)
             amt = c2.number_input("Total Amount", min_value=0.01)
 
-        # D. INCOME / REFUND
         elif t_type in ["Income", "Refund"]:
             t_acc = st.selectbox("Deposit To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
-        # E. TRANSFER / CUSTODIAL IN
         elif t_type in ["Transfer", "Custodial In"]:
             c_a, c_b = st.columns(2)
             f_acc = c_a.selectbox("From", non_loan_accounts)
             t_acc = c_b.selectbox("To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
-        # Common Fields
+        # --- CATEGORY FIX: Allow Blank ---
         cat_type = "Income" if t_type == "Income" else "Expense"
         cat_options = get_categories(cat_type)['name'].tolist()
-        category = st.selectbox("Category", cat_options)
+        # Add an empty string at the start to allow "Blank" selection
+        category = st.selectbox("Category", [""] + cat_options)
         
         desc = st.text_input("Description")
         remark = st.text_area("Notes", height=2)
@@ -261,22 +234,23 @@ with tab2:
         submitted = st.form_submit_button("Submit Transaction")
         
         if submitted:
+            # DEFAULT TO "Others" IF BLANK
+            final_cat = category if category.strip() != "" else "Others"
+            
             if t_type == "Expense" and is_split:
                 if amt1 > 0:
-                    add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, category, remark)
+                    add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, final_cat, remark)
                 if amt2 > 0:
-                    add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, category, remark)
+                    add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, final_cat, remark)
             
             elif t_type == "Custodial Expense":
-                # Double Entry Logic
-                add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, category, f"Real payment for {cust_acc}")
-                add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, category, f"Virtual deduction via {bank_acc}")
+                add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
+                add_transaction(tx_date, amt, f"{desc} (Virtual)", "Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
                 
             else:
-                # Standard
                 f_id = account_map.get(f_acc) if 'f_acc' in locals() and f_acc else None
                 t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
-                add_transaction(tx_date, amt, desc, t_type, f_id, t_id, category, remark)
+                add_transaction(tx_date, amt, desc, t_type, f_id, t_id, final_cat, remark)
             
             st.success("Transaction Saved!")
             clear_cache()
@@ -290,11 +264,10 @@ with tab3:
             st.write(f"**{row['name']}** - ${row['balance']:,.2f} / ${row['goal_amount']:,.2f}")
             st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
 
-# --- TAB 4: SCHEDULE (RESTORED) ---
+# --- TAB 4: SCHEDULE ---
 with tab4:
     st.subheader("Manage Future Payments")
     
-    # 1. Add New Schedule
     with st.expander("➕ Add Schedule", expanded=False):
         with st.form("sch_form"):
             s_desc = st.text_input("Description")
@@ -303,8 +276,9 @@ with tab4:
             s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
             s_date = c3.date_input("Start Date", datetime.today())
             
-            s_cat = st.selectbox("Category", get_categories()['name'].tolist())
-            s_manual = st.checkbox("🔔 Manual Reminder? (Tick if you transfer manually)", value=False)
+            s_cat_opts = get_categories()['name'].tolist()
+            s_cat = st.selectbox("Category", [""] + s_cat_opts)
+            s_manual = st.checkbox("🔔 Manual Reminder?", value=False)
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
             s_from, s_to = None, None
@@ -315,18 +289,18 @@ with tab4:
                 s_to = st.selectbox("To", account_list, key="s_t")
                 
             if st.form_submit_button("Schedule It"):
+                final_sch_cat = s_cat if s_cat.strip() != "" else "Others"
                 f_id = account_map.get(s_from)
                 t_id = account_map.get(s_to)
                 supabase.table('schedule').insert({
                     "description": s_desc, "amount": s_amount, "type": s_type, 
                     "from_account_id": f_id, "to_account_id": t_id, 
                     "frequency": s_freq, "next_run_date": str(s_date),
-                    "is_manual": s_manual, "category": s_cat
+                    "is_manual": s_manual, "category": final_sch_cat
                 }).execute()
                 st.success("Scheduled!")
                 clear_cache()
 
-    # 2. View Upcoming
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
@@ -342,7 +316,6 @@ with tab4:
 with tab5:
     st.subheader("🔧 Configuration")
     
-    # 1. CATEGORY EDITOR (Bulk + Auto ID)
     st.write("### 🏷️ Edit Categories")
     st.caption("Click the '+' row at bottom to add. **Leave ID blank** for new rows.")
     
@@ -351,26 +324,22 @@ with tab5:
         edited_cats = st.data_editor(
             df_cats[['id', 'name', 'type', 'budget_limit']], 
             key="cat_editor",
-            num_rows="dynamic", # Enables Add Row
-            disabled=['id'],    # ID cannot be typed, only generated
+            num_rows="dynamic",
+            disabled=['id'],
             column_config={
                 "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income"]),
                 "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f")
             }
         )
-        
         if st.button("💾 Save Categories"):
             save_bulk_editor('categories', edited_cats)
             st.success("Categories Updated!")
 
     st.divider()
 
-    # 2. ACCOUNT EDITOR (Bulk + Auto ID)
     st.write("### 🏦 Edit Accounts")
-    
     df_all_accounts = get_accounts(show_inactive=True)
     if not df_all_accounts.empty:
-        # We allow editing most fields, but disable ID
         edited_accs = st.data_editor(
             df_all_accounts[['id', 'name', 'type', 'balance', 'currency', 'sort_order', 'is_active']], 
             key="account_editor",
@@ -381,7 +350,6 @@ with tab5:
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
             }
         )
-        
         if st.button("💾 Save Accounts"):
             save_bulk_editor('accounts', edited_accs)
             st.success("Accounts Updated!")
