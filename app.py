@@ -42,6 +42,7 @@ def get_accounts(show_inactive=False):
     accounts = supabase.table('accounts').select("*").execute().data
     df = pd.DataFrame(accounts)
     
+    # All columns we expect in the DB
     cols = ['id', 'name', 'type', 'balance', 'include_net_worth', 'is_liquid_asset', 
             'goal_amount', 'goal_date', 'sort_order', 'is_active', 'remark', 
             'currency', 'manual_exchange_rate']
@@ -52,7 +53,7 @@ def get_accounts(show_inactive=False):
         'sort_order': 99, 'is_active': True, 'remark': "", 
         'currency': "SGD", 'manual_exchange_rate': 1.0, 
         'include_net_worth': True, 'is_liquid_asset': True,
-        'goal_amount': 0
+        'goal_amount': 0, 'goal_date': None
     }
     for col, val in defaults.items():
         if col not in df.columns: df[col] = val
@@ -84,18 +85,37 @@ def save_bulk_editor(table_name, df_edited):
     records = df_edited.to_dict('records')
     for row in records:
         if table_name == 'accounts':
-            if pd.isna(row.get('goal_amount')): row['goal_amount'] = 0
-            if pd.isna(row.get('manual_exchange_rate')): row['manual_exchange_rate'] = 1.0
+            # Use .get() to prevent crashes if columns are hidden/missing
+            safe_goal = row.get('goal_amount', 0)
+            if pd.isna(safe_goal): safe_goal = 0
+            
+            safe_rate = row.get('manual_exchange_rate', 1.0)
+            if pd.isna(safe_rate): safe_rate = 1.0
+            
             data = {
-                "name": row['name'], "balance": row['balance'], "type": row['type'],
-                "currency": row['currency'], "manual_exchange_rate": row['manual_exchange_rate'],
-                "remark": row['remark'], "is_active": row['is_active'], "sort_order": row['sort_order'],
-                "include_net_worth": row['include_net_worth'], "is_liquid_asset": row['is_liquid_asset']
+                "name": row.get('name'), 
+                "balance": row.get('balance'), 
+                "type": row.get('type'),
+                "currency": row.get('currency', 'SGD'), 
+                "manual_exchange_rate": safe_rate,
+                "remark": row.get('remark', ''), 
+                "is_active": row.get('is_active', True), 
+                "sort_order": row.get('sort_order', 99),
+                "include_net_worth": row.get('include_net_worth', True), 
+                "is_liquid_asset": row.get('is_liquid_asset', True),
+                "goal_amount": safe_goal,
+                "goal_date": row.get('goal_date')
             }
+            # Clean up None/NaN values for Supabase
+            if pd.isna(data['goal_date']): data['goal_date'] = None
+            
         elif table_name == 'categories':
-             if pd.isna(row.get('budget_limit')): row['budget_limit'] = 0
+             safe_limit = row.get('budget_limit', 0)
+             if pd.isna(safe_limit): safe_limit = 0
              data = {
-                 "name": row['name'], "type": row['type'], "budget_limit": row['budget_limit']
+                 "name": row['name'], 
+                 "type": row['type'], 
+                 "budget_limit": safe_limit
              }
         
         row_id = row.get('id')
@@ -103,6 +123,7 @@ def save_bulk_editor(table_name, df_edited):
             supabase.table(table_name).update(data).eq("id", row_id).execute()
         else:
             supabase.table(table_name).insert(data).execute()
+    
     clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
@@ -222,10 +243,9 @@ with tab2:
             t_acc = c_b.selectbox("To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
-        # --- CATEGORY FIX: Allow Blank ---
+        # Categories
         cat_type = "Income" if t_type == "Income" else "Expense"
         cat_options = get_categories(cat_type)['name'].tolist()
-        # Add an empty string at the start to allow "Blank" selection
         category = st.selectbox("Category", [""] + cat_options)
         
         desc = st.text_input("Description")
@@ -234,7 +254,6 @@ with tab2:
         submitted = st.form_submit_button("Submit Transaction")
         
         if submitted:
-            # DEFAULT TO "Others" IF BLANK
             final_cat = category if category.strip() != "" else "Others"
             
             if t_type == "Expense" and is_split:
@@ -317,8 +336,7 @@ with tab5:
     st.subheader("🔧 Configuration")
     
     st.write("### 🏷️ Edit Categories")
-    st.caption("Click the '+' row at bottom to add. **Leave ID blank** for new rows.")
-    
+    st.caption("Click '+' row to add. Leave ID blank for new rows.")
     df_cats = get_categories()
     if not df_cats.empty:
         edited_cats = st.data_editor(
@@ -338,16 +356,26 @@ with tab5:
     st.divider()
 
     st.write("### 🏦 Edit Accounts")
+    # FIX: Show ALL columns so the save function has access to 'remark', 'goals', etc.
     df_all_accounts = get_accounts(show_inactive=True)
     if not df_all_accounts.empty:
+        # Full column list for editing
+        cols_to_edit = [
+            'id', 'name', 'type', 'balance', 'currency', 'manual_exchange_rate',
+            'goal_amount', 'goal_date', 'include_net_worth', 'is_liquid_asset',
+            'sort_order', 'is_active', 'remark'
+        ]
+        
         edited_accs = st.data_editor(
-            df_all_accounts[['id', 'name', 'type', 'balance', 'currency', 'sort_order', 'is_active']], 
+            df_all_accounts[cols_to_edit], 
             key="account_editor",
             num_rows="dynamic",
             disabled=['id'],
             column_config={
                 "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
+                "goal_date": st.column_config.DateColumn("Goal Date"),
+                "manual_exchange_rate": st.column_config.NumberColumn("Rate", format="%.4f"),
             }
         )
         if st.button("💾 Save Accounts"):
