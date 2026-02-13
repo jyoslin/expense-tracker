@@ -140,7 +140,7 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
 
     if type == "Expense": update_balance(from_acc_id, -amount)
     elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
-    elif type == "Increase Loan": update_balance(to_acc_id, amount) # Adds to the loan amount
+    elif type == "Increase Loan": update_balance(to_acc_id, -amount) # FIX: Makes loan balance more negative (increases liability)
     elif type == "Transfer":
         if from_acc_id: update_balance(from_acc_id, -amount)
         if to_acc_id: update_balance(to_acc_id, amount)
@@ -177,8 +177,26 @@ if menu == "📊 Overview":
     
     st.divider()
 
+    # FIX: Show all account balances at a glance
+    st.subheader("💳 Current Balances")
+    if not df_active.empty:
+        df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
+        st.dataframe(
+            df_display, 
+            hide_index=True, 
+            use_container_width=True,
+            column_config={
+                "name": "Account Name",
+                "type": "Type",
+                "balance": st.column_config.NumberColumn("Balance", format="%.2f"),
+                "currency": "Currency"
+            }
+        )
+
+    st.divider()
+
     st.subheader("📜 Account Statement")
-    selected_acc_name = st.selectbox("Select Account to View:", account_list, key="ledger_select")
+    selected_acc_name = st.selectbox("Select Account to View Statement:", account_list, key="ledger_select")
     
     if selected_acc_name:
         sel_id = account_map[selected_acc_name]
@@ -199,7 +217,7 @@ if menu == "📊 Overview":
                 elif row['type'] == 'Expense':
                     amt = -amt
                 elif row['type'] == 'Increase Loan':
-                    amt = amt # Increases loan balance
+                    amt = -amt # Shows as a negative deduction on the statement
                 
                 view_data.append({
                     "Date": row['date'], "Description": desc, "Amount": amt, 
@@ -212,6 +230,9 @@ if menu == "📊 Overview":
 # --- MENU: ENTRY ---
 elif menu == "📝 Entry":
     st.header("📝 New Transaction")
+    
+    # FIX: Container for success message specifically at the TOP of the page
+    msg_container = st.empty() 
     
     t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan"], horizontal=True)
     
@@ -318,7 +339,9 @@ elif menu == "📝 Entry":
                     t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
                     add_transaction(tx_date, amt, desc, t_type, f_id, t_id, final_cat, remark)
                 
-                st.success("Transaction Saved!")
+                # TRIGGER MESSAGES HERE
+                msg_container.success(f"✅ Transaction Saved Successfully! ({desc})")
+                st.toast("Transaction Saved!", icon="✅")
                 clear_cache()
 
 # --- MENU: GOALS ---
