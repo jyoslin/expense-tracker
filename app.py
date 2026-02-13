@@ -140,12 +140,39 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
 
     if type == "Expense": update_balance(from_acc_id, -amount)
     elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
-    elif type == "Increase Loan": update_balance(to_acc_id, -amount) # FIX: Makes loan balance more negative (increases liability)
+    elif type == "Increase Loan": update_balance(to_acc_id, -amount) 
     elif type == "Transfer":
         if from_acc_id: update_balance(from_acc_id, -amount)
         if to_acc_id: update_balance(to_acc_id, amount)
     
     clear_cache()
+
+# --- NEW: DELETE & REVERSE FUNCTION ---
+def delete_transaction(tx_id):
+    # Fetch the transaction to know how to reverse it
+    tx_data = supabase.table('transactions').select("*").eq('id', tx_id).execute().data
+    if not tx_data:
+        return False
+        
+    tx = tx_data[0]
+    amt = float(tx['amount'])
+    t_type = tx['type']
+    
+    # Reverse the balance changes
+    if t_type == "Expense": 
+        update_balance(tx['from_account_id'], amt) # Add back to account
+    elif t_type in ["Income", "Refund"]: 
+        update_balance(tx['to_account_id'], -amt) # Remove from account
+    elif t_type == "Increase Loan": 
+        update_balance(tx['to_account_id'], amt) # Reverse the negative hit
+    elif t_type == "Transfer":
+        if tx['from_account_id']: update_balance(tx['from_account_id'], amt)
+        if tx['to_account_id']: update_balance(tx['to_account_id'], -amt)
+
+    # Delete the record
+    supabase.table('transactions').delete().eq('id', tx_id).execute()
+    clear_cache()
+    return True
 
 # --- 3. APP START ---
 st.title("💰 My Wealth Manager")
@@ -153,7 +180,6 @@ df_active = get_accounts(show_inactive=False)
 account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
-# Non-loan accounts are strictly enforced for Expenses/Transfers FROM
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 
 # --- SIDEBAR NAVIGATION ---
@@ -177,7 +203,6 @@ if menu == "📊 Overview":
     
     st.divider()
 
-    # FIX: Show all account balances at a glance
     st.subheader("💳 Current Balances")
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
@@ -217,13 +242,14 @@ if menu == "📊 Overview":
                 elif row['type'] == 'Expense':
                     amt = -amt
                 elif row['type'] == 'Increase Loan':
-                    amt = -amt # Shows as a negative deduction on the statement
+                    amt = -amt 
                 
                 view_data.append({
+                    "ID": row['id'], # Show ID so they know what to delete
                     "Date": row['date'], "Description": desc, "Amount": amt, 
                     "Category": row['category'], "Type": row['type']
                 })
-            st.dataframe(pd.DataFrame(view_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(view_data), use_container_width=True, hide_index=True)
         else:
             st.info("No recent transactions found.")
 
@@ -231,7 +257,6 @@ if menu == "📊 Overview":
 elif menu == "📝 Entry":
     st.header("📝 New Transaction")
     
-    # FIX: Container for success message specifically at the TOP of the page
     msg_container = st.empty() 
     
     t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan"], horizontal=True)
@@ -310,13 +335,11 @@ elif menu == "📝 Entry":
         if submitted:
             final_cat = category if category.strip() != "" else "Others"
             
-            # --- MANDATORY DESCRIPTION VALIDATION FOR LOAN ---
             if t_type == "Increase Loan" and desc.strip() == "":
                 st.error("❌ Details (Description) are MANDATORY when increasing a loan amount.")
             elif t_type == "Increase Loan" and not t_acc:
                 st.error("❌ No loan account selected.")
             else:
-                # --- PROCESS TRANSACTION ---
                 if t_type == "Expense" and is_split:
                     if amt1 > 0:
                         add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, final_cat, remark)
@@ -339,7 +362,6 @@ elif menu == "📝 Entry":
                     t_id = account_map.get(t_acc) if 't_acc' in locals() and t_acc else None
                     add_transaction(tx_date, amt, desc, t_type, f_id, t_id, final_cat, remark)
                 
-                # TRIGGER MESSAGES HERE
                 msg_container.success(f"✅ Transaction Saved Successfully! ({desc})")
                 st.toast("Transaction Saved!", icon="✅")
                 clear_cache()
@@ -406,6 +428,28 @@ elif menu == "📅 Schedule":
 # --- MENU: SETTINGS ---
 elif menu == "⚙️ Settings":
     st.header("🔧 Configuration")
+
+    # --- NEW: LEDGER MAINTENANCE TOOL ---
+    st.write("### 🗑️ Delete / Reverse Transaction")
+    st.info("To edit a mistake, delete it here (which restores your balances) and re-enter it correctly in the Entry tab. *Note: If you made a mistake on a Custodial/Split payment, you will need to delete BOTH generated IDs.*")
+    
+    del_col1, del_col2 = st.columns([1, 2])
+    with del_col1:
+        del_id = st.number_input("Enter Transaction ID to Delete", step=1, min_value=0)
+    with del_col2:
+        st.write("") # Spacing
+        st.write("")
+        if st.button("⚠️ Delete & Restore Balances"):
+            if del_id > 0:
+                success = delete_transaction(del_id)
+                if success:
+                    st.success(f"Transaction {del_id} deleted and balances restored!")
+                else:
+                    st.error("Transaction ID not found.")
+            else:
+                st.warning("Please enter a valid ID.")
+
+    st.divider()
     
     st.write("### 🏷️ Edit Categories")
     st.caption("Click '+' row to add. ID is now hidden automatically.")
