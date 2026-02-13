@@ -70,7 +70,6 @@ def get_accounts(show_inactive=False):
     if not show_inactive:
         df = df[df['is_active'] == True]
         
-    # Hierarchical sorting (Type -> Sort Order -> Name)
     type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
     df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
     
@@ -97,42 +96,50 @@ def update_balance(account_id, amount_change):
     new_balance = float(current) + float(amount_change)
     supabase.table('accounts').update({"balance": new_balance}).eq("id", account_id).execute()
 
-def save_bulk_editor(table_name, df_edited):
-    records = df_edited.to_dict('records')
-    for row in records:
-        clean_row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
-        
-        if not clean_row.get('name') or str(clean_row.get('name')).strip() == "":
-            continue 
-            
-        if table_name == 'accounts':
-            data = {
-                "name": clean_row.get('name'), 
-                "balance": clean_row.get('balance') or 0.0, 
-                "type": clean_row.get('type'),
-                "currency": clean_row.get('currency') or 'SGD', 
-                "manual_exchange_rate": clean_row.get('manual_exchange_rate') or 1.0,
-                "remark": clean_row.get('remark') or '', 
-                "is_active": clean_row.get('is_active') if clean_row.get('is_active') is not None else True, 
-                "sort_order": clean_row.get('sort_order') or 99,
-                "include_net_worth": clean_row.get('include_net_worth') if clean_row.get('include_net_worth') is not None else True, 
-                "is_liquid_asset": clean_row.get('is_liquid_asset') if clean_row.get('is_liquid_asset') is not None else True,
-                "goal_amount": clean_row.get('goal_amount') or 0.0,
-                "goal_date": str(clean_row.get('goal_date')) if clean_row.get('goal_date') else None
-            }
-        elif table_name == 'categories':
-             data = {
-                 "name": clean_row.get('name'), 
-                 "type": clean_row.get('type'), 
-                 "budget_limit": clean_row.get('budget_limit') or 0.0
-             }
-        
-        row_id = clean_row.get('id')
-        if row_id is not None:
-            supabase.table(table_name).update(data).eq("id", row_id).execute()
-        else:
-            supabase.table(table_name).insert(data).execute()
+# --- THE NEW STATE-TRACKING SAVE FUNCTION ---
+def apply_editor_changes(table_name, original_df, editor_key):
+    changes = st.session_state[editor_key]
     
+    # 1. PROCESS DELETIONS
+    for idx in changes.get("deleted_rows", []):
+        row_id = original_df.iloc[idx]['id']
+        supabase.table(table_name).delete().eq('id', row_id).execute()
+        
+    # 2. PROCESS EDITS TO EXISTING ROWS
+    for idx_str, edits in changes.get("edited_rows", {}).items():
+        idx = int(idx_str)
+        row_id = original_df.iloc[idx]['id']
+        
+        # Safely convert dates to text for database saving
+        if 'goal_date' in edits:
+            edits['goal_date'] = str(edits['goal_date']) if edits['goal_date'] else None
+            
+        supabase.table(table_name).update(edits).eq('id', row_id).execute()
+        
+    # 3. PROCESS NEW ADDITIONS
+    for new_row in changes.get("added_rows", []):
+        if not new_row.get('name') or str(new_row.get('name')).strip() == "":
+            continue # Skip accidentally created blank rows entirely
+            
+        # Provide safe default values for databases to prevent crashes
+        if table_name == 'accounts':
+            new_row.setdefault('balance', 0.0)
+            new_row.setdefault('currency', 'SGD')
+            new_row.setdefault('manual_exchange_rate', 1.0)
+            new_row.setdefault('is_active', True)
+            new_row.setdefault('sort_order', 99)
+            new_row.setdefault('include_net_worth', True)
+            new_row.setdefault('is_liquid_asset', True)
+            new_row.setdefault('goal_amount', 0.0)
+            new_row.setdefault('type', 'Bank')
+            if 'goal_date' in new_row:
+                new_row['goal_date'] = str(new_row['goal_date']) if new_row['goal_date'] else None
+        elif table_name == 'categories':
+            new_row.setdefault('budget_limit', 0.0)
+            new_row.setdefault('type', 'Expense')
+            
+        supabase.table(table_name).insert(new_row).execute()
+        
     clear_cache()
 
 def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, category, remark):
@@ -143,7 +150,7 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
     }).execute()
 
     if type == "Expense": update_balance(from_acc_id, -amount)
-    elif type in ["Income", "Refund"]: update_balance(to_acc_id, amount)
+    elif type == "Income": update_balance(to_acc_id, amount)
     elif type == "Increase Loan": update_balance(to_acc_id, -amount) 
     elif type == "Transfer":
         if from_acc_id: update_balance(from_acc_id, -amount)
@@ -162,7 +169,7 @@ def delete_transaction(tx_id):
     
     if t_type == "Expense": 
         update_balance(tx['from_account_id'], amt) 
-    elif t_type in ["Income", "Refund"]: 
+    elif t_type == "Income": 
         update_balance(tx['to_account_id'], -amt) 
     elif t_type == "Increase Loan": 
         update_balance(tx['to_account_id'], amt) 
@@ -291,7 +298,6 @@ elif menu == "📝 Entry":
         c1, c2 = st.columns(2)
         tx_date = c1.date_input("Date", datetime.today())
         
-        # Branching Logic
         if t_type == "Expense" and is_split:
             st.info("Split Payment: Amount 1 + Amount 2 = Total Expense")
             col_a, col_b = st.columns(2)
@@ -324,7 +330,7 @@ elif menu == "📝 Entry":
             bank_acc = c_b.selectbox("Deposit to Bank (Actual)", bank_opts)
             amt = c2.number_input("Total Amount", min_value=0.01)
 
-        elif t_type in ["Income", "Refund"]:
+        elif t_type == "Income":
             t_acc = st.selectbox("Deposit To", account_list)
             amt = c2.number_input("Amount", min_value=0.01)
 
@@ -344,7 +350,6 @@ elif menu == "📝 Entry":
                 t_acc = st.selectbox("Select Loan Account", loan_opts)
             amt = c2.number_input("Amount to Add to Loan", min_value=0.01)
 
-        # Categories filter logic updated to include "Fund"
         df_cats_full = get_categories()
         if df_cats_full.empty:
             cat_options = []
@@ -352,9 +357,8 @@ elif menu == "📝 Entry":
             if t_type in ["Income", "Custodial In"]:
                 cat_options = df_cats_full[df_cats_full['type'] == 'Income']['name'].tolist()
             elif t_type == "Transfer":
-                cat_options = df_cats_full['name'].tolist() # Allow any category for transfers
+                cat_options = df_cats_full['name'].tolist() 
             else:
-                # Show both Expense and Fund categories for Expenses and Loans
                 cat_options = df_cats_full[df_cats_full['type'].isin(['Expense', 'Fund'])]['name'].tolist()
                 
         category = st.selectbox("Category", [""] + cat_options)
@@ -462,43 +466,45 @@ elif menu == "⚙️ Settings":
     st.header("🔧 Configuration")
     
     st.write("### 🏷️ Edit Categories")
-    st.caption("Click '+' row to add. ID is now hidden automatically.")
     df_cats = get_categories()
+    
+    # We pass the dataframe completely WITHOUT the 'id' column to the frontend table
     if not df_cats.empty:
-        edited_cats = st.data_editor(
-            df_cats[['id', 'name', 'type', 'budget_limit']], 
+        st.data_editor(
+            df_cats[['name', 'type', 'budget_limit']], 
             key="cat_editor",
             num_rows="dynamic",
             hide_index=True, 
             column_config={
-                "id": None,  
-                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Fund"]), # Added Fund option
+                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Fund"]), 
                 "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01) 
             }
         )
         if st.button("💾 Save Categories"):
-            save_bulk_editor('categories', edited_cats)
+            # The tracking function applies edits secretly based on Streamlit's session state
+            apply_editor_changes('categories', df_cats, 'cat_editor')
             st.success("Categories Updated!")
+            st.rerun()
 
     st.divider()
 
     st.write("### 🏦 Edit Accounts")
-    st.caption("Click '+' row to add. ID is now hidden automatically.")
     df_all_accounts = get_accounts(show_inactive=True)
+    
     if not df_all_accounts.empty:
+        # Notice how 'id' is completely missing from this list
         cols_to_edit = [
-            'id', 'name', 'type', 'balance', 'currency', 'manual_exchange_rate',
+            'name', 'type', 'balance', 'currency', 'manual_exchange_rate',
             'goal_amount', 'goal_date', 'include_net_worth', 'is_liquid_asset',
             'sort_order', 'is_active', 'remark'
         ]
         
-        edited_accs = st.data_editor(
+        st.data_editor(
             df_all_accounts[cols_to_edit], 
             key="account_editor",
             num_rows="dynamic",
             hide_index=True, 
             column_config={
-                "id": None,  
                 "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
@@ -507,5 +513,6 @@ elif menu == "⚙️ Settings":
             }
         )
         if st.button("💾 Save Accounts"):
-            save_bulk_editor('accounts', edited_accs)
+            apply_editor_changes('accounts', df_all_accounts, 'account_editor')
             st.success("Accounts Updated!")
+            st.rerun()
