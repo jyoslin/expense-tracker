@@ -70,7 +70,11 @@ def get_accounts(show_inactive=False):
     if not show_inactive:
         df = df[df['is_active'] == True]
         
-    return df.sort_values(by=['sort_order', 'name'])
+    # FIX: Implement hierarchical sorting (Type -> Sort Order -> Name)
+    type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
+    df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
+    
+    return df.sort_values(by=['type', 'sort_order', 'name'])
 
 @st.cache_data(ttl=3600)
 def get_categories(type_filter=None):
@@ -147,9 +151,7 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
     
     clear_cache()
 
-# --- NEW: DELETE & REVERSE FUNCTION ---
 def delete_transaction(tx_id):
-    # Fetch the transaction to know how to reverse it
     tx_data = supabase.table('transactions').select("*").eq('id', tx_id).execute().data
     if not tx_data:
         return False
@@ -158,18 +160,16 @@ def delete_transaction(tx_id):
     amt = float(tx['amount'])
     t_type = tx['type']
     
-    # Reverse the balance changes
     if t_type == "Expense": 
-        update_balance(tx['from_account_id'], amt) # Add back to account
+        update_balance(tx['from_account_id'], amt) 
     elif t_type in ["Income", "Refund"]: 
-        update_balance(tx['to_account_id'], -amt) # Remove from account
+        update_balance(tx['to_account_id'], -amt) 
     elif t_type == "Increase Loan": 
-        update_balance(tx['to_account_id'], amt) # Reverse the negative hit
+        update_balance(tx['to_account_id'], amt) 
     elif t_type == "Transfer":
         if tx['from_account_id']: update_balance(tx['from_account_id'], amt)
         if tx['to_account_id']: update_balance(tx['to_account_id'], -amt)
 
-    # Delete the record
     supabase.table('transactions').delete().eq('id', tx_id).execute()
     clear_cache()
     return True
@@ -245,11 +245,34 @@ if menu == "📊 Overview":
                     amt = -amt 
                 
                 view_data.append({
-                    "ID": row['id'], # Show ID so they know what to delete
+                    "ID": row['id'], 
                     "Date": row['date'], "Description": desc, "Amount": amt, 
                     "Category": row['category'], "Type": row['type']
                 })
             st.dataframe(pd.DataFrame(view_data), use_container_width=True, hide_index=True)
+            
+            st.divider()
+            
+            # FIX: Moved Delete function to Overview Tab, right below the statement
+            st.write("### 🗑️ Delete / Reverse Transaction")
+            st.info("To edit a mistake, delete its ID here to restore your balances, then re-enter it correctly.")
+            
+            del_col1, del_col2 = st.columns([1, 2])
+            with del_col1:
+                del_id = st.number_input("Enter Transaction ID to Delete", step=1, min_value=0)
+            with del_col2:
+                st.write("") 
+                st.write("")
+                if st.button("⚠️ Delete & Restore Balances"):
+                    if del_id > 0:
+                        success = delete_transaction(del_id)
+                        if success:
+                            st.success(f"Transaction {del_id} deleted and balances restored!")
+                            st.rerun() # Refreshes the view automatically
+                        else:
+                            st.error("Transaction ID not found.")
+                    else:
+                        st.warning("Please enter a valid ID.")
         else:
             st.info("No recent transactions found.")
 
@@ -428,28 +451,6 @@ elif menu == "📅 Schedule":
 # --- MENU: SETTINGS ---
 elif menu == "⚙️ Settings":
     st.header("🔧 Configuration")
-
-    # --- NEW: LEDGER MAINTENANCE TOOL ---
-    st.write("### 🗑️ Delete / Reverse Transaction")
-    st.info("To edit a mistake, delete it here (which restores your balances) and re-enter it correctly in the Entry tab. *Note: If you made a mistake on a Custodial/Split payment, you will need to delete BOTH generated IDs.*")
-    
-    del_col1, del_col2 = st.columns([1, 2])
-    with del_col1:
-        del_id = st.number_input("Enter Transaction ID to Delete", step=1, min_value=0)
-    with del_col2:
-        st.write("") # Spacing
-        st.write("")
-        if st.button("⚠️ Delete & Restore Balances"):
-            if del_id > 0:
-                success = delete_transaction(del_id)
-                if success:
-                    st.success(f"Transaction {del_id} deleted and balances restored!")
-                else:
-                    st.error("Transaction ID not found.")
-            else:
-                st.warning("Please enter a valid ID.")
-
-    st.divider()
     
     st.write("### 🏷️ Edit Categories")
     st.caption("Click '+' row to add. ID is now hidden automatically.")
