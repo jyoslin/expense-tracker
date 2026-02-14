@@ -723,14 +723,18 @@ elif menu == "🎯 Goals":
                     term = int(term_match.group(1)) if term_match else 12
                     term = max(1, term)
                     
-                    # Clean the remark for display and editing
+                    # Clean the remark for display
                     clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
                     clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
+                    
+                    # MOVED: Show the Remark/Notes on the front of the card
+                    if clean_remark:
+                        st.info(f"📝 {clean_remark}")
                     
                     monthly_contrib = row['goal_amount'] / term if term > 0 else 0
                     
                     st.metric("Current Saved", f"${row['balance']:,.2f}")
-                    goal_str = row['goal_date'].strftime("%b %Y") if pd.notnull(row['goal_date']) else "No Date"
+                    goal_str = row['goal_date'].strftime("%d %b %Y") if pd.notnull(row['goal_date']) else "No Date"
                     st.caption(f"**Target:** ${row['goal_amount']:,.2f} by {goal_str}")
                     
                     st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
@@ -739,14 +743,8 @@ elif menu == "🎯 Goals":
                     today = date.today()
                     expected_bal = 0.0
                     if pd.notnull(row['goal_date']):
-                        # Calculate full calendar months between now and target
                         months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
-                        
-                        # NEW: Adjust elapsed to be inclusive of the current month
-                        # If months_left is 12 and term is 12, elapsed becomes 1.
                         months_elapsed = (term - months_left) + 1
-                        
-                        # Constraints: Cannot be less than 0 or more than the total term
                         months_elapsed = max(0, min(term, months_elapsed)) 
                         expected_bal = months_elapsed * monthly_contrib
 
