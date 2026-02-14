@@ -932,7 +932,10 @@ elif menu == "⚙️ Settings":
             num_rows="dynamic",
             hide_index=True, 
             column_config={
-                "type": st.column_config.SelectboxColumn("Type", options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]),
+                "type": st.column_config.SelectboxColumn(
+                    "Type", 
+                    options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]
+                ),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
                 "goal_amount": st.column_config.NumberColumn("Goal Amount", format="%.2f", step=0.01), 
