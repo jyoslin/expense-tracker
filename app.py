@@ -183,6 +183,7 @@ account_map = dict(zip(df_active['name'], df_active['id']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
+expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Custodial', 'Sinking Fund'])]['name'].tolist() if not df_active.empty else []
 
 # --- SIDEBAR NAVIGATION ---
 st.sidebar.title("Navigation")
@@ -295,7 +296,6 @@ elif menu == "📝 Entry":
     
     msg_container = st.empty() 
     
-    # NEW: Added Sinking Fund Expense
     t_type = st.radio("Type", ["Expense", "Income", "Transfer", "Custodial Expense", "Custodial In", "Increase Loan", "Sinking Fund Expense"], horizontal=True)
     
     is_split = False
@@ -306,28 +306,33 @@ elif menu == "📝 Entry":
         c1, c2 = st.columns(2)
         tx_date = c1.date_input("Date", datetime.today())
         
+        # --- NORMAL EXPENSE (Uses filtered expense_src_accounts) ---
         if t_type == "Expense" and is_split:
             st.info("Split Payment: Amount 1 + Amount 2 = Total Expense")
             col_a, col_b = st.columns(2)
             with col_a:
-                acc1 = st.selectbox("Source 1", non_loan_accounts, key="src1")
+                acc1 = st.selectbox("Source 1", expense_src_accounts, key="src1")
                 amt1 = st.number_input("Amount 1", min_value=0.0, format="%.2f")
             with col_b:
-                acc2 = st.selectbox("Source 2", non_loan_accounts, key="src2")
+                acc2 = st.selectbox("Source 2", expense_src_accounts, key="src2")
                 amt2 = st.number_input("Amount 2", min_value=0.0, format="%.2f")
         
         elif t_type == "Expense":
-            f_acc = st.selectbox("Paid From", non_loan_accounts)
+            f_acc = st.selectbox("Paid From", expense_src_accounts)
             amt = c2.number_input("Amount", min_value=0.01)
 
+        # --- CUSTODIAL EXPENSE (Split actual vs virtual amounts) ---
         elif t_type == "Custodial Expense":
-            st.warning("🔻 Deducts from Virtual Custodial Account AND Actual Bank Account")
+            st.warning("🔻 Empties the Virtual Custodial Account, and deducts from Actual Bank Account")
             c_a, c_b = st.columns(2)
             cust_opts = df_active[df_active['type']=='Custodial']['name']
             bank_opts = df_active[df_active['type']=='Bank']['name']
+            
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts)
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts)
-            amt = c2.number_input("Total Amount", min_value=0.01)
+            
+            amt = c1.number_input("Total Custodial Deduction", min_value=0.01, help="Total amount to remove from the virtual Custodial envelope (e.g. 1224.25)")
+            amt_bank = c2.number_input("Actual Amount Paid from Bank", min_value=0.00, help="Amount actually paid from Bank (e.g. 1220). If you used some untracked cash, this will be lower.")
 
         elif t_type == "Custodial In":
             st.info("🔼 Deposits Virtual money to Custodial AND Actual money to Bank")
@@ -400,8 +405,13 @@ elif menu == "📝 Entry":
                         add_transaction(tx_date, amt2, f"{desc} (Split 2)", "Expense", account_map[acc2], None, final_cat, remark)
                 
                 elif t_type == "Custodial Expense":
-                    add_transaction(tx_date, amt, f"{desc} (Custodial)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
-                    add_transaction(tx_date, amt, f"{desc} (Virtual)", "Virtual Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
+                    # 1. Deduct the ACTUAL amount paid from the Bank (if any)
+                    if amt_bank > 0:
+                        add_transaction(tx_date, amt_bank, f"{desc} (Actual Payment)", "Expense", account_map[bank_acc], None, final_cat, f"Real payment for {cust_acc}")
+                    
+                    # 2. Deduct the FULL amount from the Virtual Custodial Account
+                    if amt > 0:
+                        add_transaction(tx_date, amt, f"{desc} (Virtual Deduction)", "Virtual Expense", account_map[cust_acc], None, final_cat, f"Virtual deduction via {bank_acc}")
                 
                 elif t_type == "Sinking Fund Expense":
                     add_transaction(tx_date, amt, f"{desc} (Actual Payment)", "Expense", account_map[bank_acc], None, final_cat, f"Paid for {sf_acc} goal")
