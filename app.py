@@ -413,39 +413,72 @@ if menu == "📊 Overview":
         view_data = future_view + past_view
         
         if view_data:
-            st.dataframe(
-                pd.DataFrame(view_data), 
+            df_view = pd.DataFrame(view_data)
+            
+            # UPGRADE: Interactive Selectable Dataframe
+            event = st.dataframe(
+                df_view, 
                 use_container_width=True, 
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="single_row",
                 column_config={
                     "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
                     "Running Balance": st.column_config.NumberColumn("Running Balance", format="$%.2f")
                 }
             )
+            
+            st.divider()
+            
+            st.write("### 🗑️ Delete / Reverse Transaction")
+            
+            # UPGRADE: Click-to-Select Safety Preview Logic
+            if len(event.selection.rows) > 0:
+                selected_idx = event.selection.rows[0]
+                selected_row = df_view.iloc[selected_idx]
+                raw_id = str(selected_row["ID"])
+                
+                with st.container(border=True):
+                    st.warning("⚠️ **Deletion Preview & Impact Analysis**")
+                    
+                    # Logic for clicking a FUTURE Scheduled Payment
+                    if raw_id.startswith("S-"):
+                        real_id = int(raw_id.replace("S-", ""))
+                        st.write(f"**Target:** Scheduled Payment - {selected_row['Description']}")
+                        st.write(f"**Date:** {selected_row['Date']}")
+                        st.write("**Impact:** No current balances will be affected. This future payment will simply be cancelled.")
+                        
+                        if st.button("🚨 Confirm Cancel Scheduled Payment", use_container_width=True):
+                            supabase.table('schedule').delete().eq('id', real_id).execute()
+                            st.success("Scheduled payment cancelled!")
+                            clear_cache()
+                            st.rerun()
+                            
+                    # Logic for clicking a PAST Transaction
+                    else:
+                        real_id = int(raw_id)
+                        st.write(f"**Target:** Past Transaction - {selected_row['Description']}")
+                        st.write(f"**Date:** {selected_row['Date']}")
+                        
+                        is_batch = False
+                        tx_data = supabase.table('transactions').select("remark").eq('id', real_id).execute().data
+                        if tx_data and "[Batch:" in (tx_data[0].get('remark') or ""):
+                            is_batch = True
+                            
+                        if is_batch:
+                            st.write("**Impact:** *Note: This is a batched transaction.* Deleting it will reverse **BOTH** the actual bank payment and the virtual envelope deduction.")
+                        else:
+                            amt = selected_row["Amount"]
+                            st.write(f"**Impact:** The transaction will be erased and **${abs(amt):,.2f}** will be restored to your accounts.")
+                            
+                        if st.button("🚨 Confirm Delete Transaction", use_container_width=True):
+                            delete_transaction(real_id)
+                            st.success("Transaction deleted and balances restored!")
+                            st.rerun()
+            else:
+                st.info("👆 **Click on any row** in the table above to view deletion options and impact analysis.")
         else:
             st.info("No recent or scheduled transactions found.")
-            
-        st.divider()
-        
-        st.write("### 🗑️ Delete / Reverse Transaction")
-        st.info("To edit a mistake, delete its ID here to restore your balances, then re-enter it correctly.")
-        
-        del_col1, del_col2 = st.columns([1, 2])
-        with del_col1:
-            del_id = st.number_input("Enter Past Transaction ID to Delete", step=1, min_value=0)
-        with del_col2:
-            st.write("") 
-            st.write("")
-            if st.button("⚠️ Delete & Restore Balances"):
-                if del_id > 0:
-                    success = delete_transaction(del_id)
-                    if success:
-                        st.success(f"Transaction {del_id} deleted and balances restored!")
-                        st.rerun()
-                    else:
-                        st.error("Transaction ID not found.")
-                else:
-                    st.warning("Please enter a valid ID.")
 
 
 # --- MENU: ENTRY ---
@@ -772,13 +805,44 @@ elif menu == "📅 Schedule":
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
         st.write("### 🗓️ Upcoming Items")
-        st.dataframe(pd.DataFrame(upcoming)[['next_run_date', 'description', 'amount', 'frequency']], hide_index=True, use_container_width=True)
+        df_upcoming = pd.DataFrame(upcoming)
         
-        with st.popover("🗑️ Delete Item"):
-            del_id = st.number_input("ID to delete", step=1)
-            if st.button("Delete Schedule"):
-                supabase.table('schedule').delete().eq("id", del_id).execute()
-                st.rerun()
+        # UPGRADE: Interactive Selectable Dataframe
+        event_sch = st.dataframe(
+            df_upcoming[['next_run_date', 'description', 'amount', 'frequency']], 
+            hide_index=True, 
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single_row"
+        )
+        
+        st.write("### 🗑️ Cancel Scheduled Item")
+        
+        # UPGRADE: Click-to-Select Safety Preview Logic
+        if len(event_sch.selection.rows) > 0:
+            sel_idx = event_sch.selection.rows[0]
+            sel_row = df_upcoming.iloc[sel_idx]
+            
+            with st.container(border=True):
+                st.warning("⚠️ **Cancellation Preview & Impact Analysis**")
+                st.write(f"**Target:** {sel_row['description']} (${sel_row['amount']:,.2f})")
+                st.write(f"**Scheduled For:** {sel_row['next_run_date']}")
+                
+                # Retrieve Account Names for clearer impact analysis
+                id_to_name = {v: k for k, v in account_map.items()}
+                f_acc = id_to_name.get(sel_row['from_account_id'], "None")
+                t_acc = id_to_name.get(sel_row['to_account_id'], "None")
+                st.write(f"**Accounts Involved:** From [{f_acc}] ➔ To [{t_acc}]")
+                
+                st.write("**Impact:** No current balances will be affected. This future payment will simply be removed from your timeline.")
+                
+                if st.button("🚨 Confirm Cancel Scheduled Payment", use_container_width=True):
+                    supabase.table('schedule').delete().eq("id", int(sel_row['id'])).execute()
+                    st.success("Scheduled payment cancelled!")
+                    clear_cache()
+                    st.rerun()
+        else:
+            st.info("👆 **Click on any row** in the table above to preview and cancel a scheduled payment.")
 
 
 # --- MENU: SETTINGS ---
