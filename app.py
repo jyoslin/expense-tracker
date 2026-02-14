@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
+import re
 
 # --- 1. SECURITY & SETUP ---
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
@@ -194,6 +195,63 @@ def delete_transaction(tx_id):
         
     clear_cache()
     return True
+
+# --- NEW: BACKGROUND AUTO-FUNDER ENGINE ---
+def run_auto_funder():
+    today = date.today()
+    first_str = today.replace(day=1).strftime("%Y-%m-%d") 
+    
+    try:
+        recent_fundings = supabase.table('transactions').select('to_account_id').eq('type', 'Virtual Funding').gte('date', first_str).execute().data
+        funded_account_ids = [tx['to_account_id'] for tx in recent_fundings]
+    except Exception:
+        funded_account_ids = []
+    
+    accounts = supabase.table('accounts').select("*").eq('type', 'Sinking Fund').execute().data
+    
+    for acc in accounts:
+        # Skip if already automatically funded this month
+        if acc['id'] in funded_account_ids:
+            continue
+        
+        remark = acc.get('remark') or ""
+        # Skip if the Auto-Fund checkbox is NOT ticked
+        if '[Auto:True]' not in remark:
+            continue
+            
+        goal_amount = float(acc.get('goal_amount') or 0)
+        balance = float(acc.get('balance') or 0)
+        
+        if goal_amount <= 0 or balance >= goal_amount:
+            continue
+            
+        # Extract the saved Term, default to 12 if not found
+        term_match = re.search(r'\[Term:(\d+)\]', remark)
+        term = int(term_match.group(1)) if term_match else 12
+        term = max(1, term) 
+        
+        # Fixed Monthly Commitment
+        monthly_contrib = goal_amount / term
+        
+        # Prevent over-funding on the very last month
+        if balance + monthly_contrib > goal_amount:
+            monthly_contrib = goal_amount - balance
+        
+        if monthly_contrib > 0:
+            add_transaction(
+                date=today, 
+                amount=monthly_contrib, 
+                description=f"Auto Monthly Funding: {acc['name']}", 
+                type="Virtual Funding", 
+                from_acc_id=None, 
+                to_acc_id=acc['id'], 
+                category="Fund", 
+                remark="Automated envelope funding"
+            )
+
+if 'auto_funded' not in st.session_state:
+    run_auto_funder()
+    st.session_state['auto_funded'] = True
 
 # --- 3. APP START ---
 st.title("💰 My Wealth Manager")
@@ -484,61 +542,96 @@ elif menu == "🎯 Goals":
         st.metric("Total Virtual Funds Saved", f"${total_saved:,.2f}")
         st.divider()
 
-        # Display Each Individual Fund Card
+        # Create a 3-column Grid Layout
+        cols = st.columns(3)
+        
+        # Display Each Individual Fund Card inside the grid
         for i, (index, row) in enumerate(goals.iterrows()):
-            with st.container(border=True):
-                st.subheader(f"🏷️ {row['name']}")
-                
-                # Goal Progress Metrics
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Current Saved", f"${row['balance']:,.2f}")
-                col2.metric("Goal Target", f"${row['goal_amount']:,.2f}")
-                goal_str = row['goal_date'].strftime("%d %b %Y") if pd.notnull(row['goal_date']) else "No Date Set"
-                col3.metric("Target Date", goal_str)
-                
-                st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
-                
-                # Smart Catch-Up Math
-                today = date.today()
-                monthly_contrib = 0.0
-                if pd.notnull(row['goal_date']) and row['goal_amount'] > 0 and row['balance'] < row['goal_amount']:
-                    months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
-                    months_left = max(1, months_left)
-                    monthly_contrib = (row['goal_amount'] - row['balance']) / months_left
-                
-                with st.expander("⚙️ Fund & Edit Goal"):
-                    # MANUAL FUNDING BUTTON
-                    if monthly_contrib > 0:
-                        st.write(f"**Suggested Monthly Funding:** ${monthly_contrib:,.2f}")
-                        if st.button(f"➕ Add Virtual Funding (${monthly_contrib:,.2f})", key=f"btn_{row['id']}"):
-                            add_transaction(today, monthly_contrib, f"Manual Envelope Funding: {row['name']}", "Virtual Funding", None, row['id'], "Fund", "Manual envelope funding")
-                            st.success(f"Added ${monthly_contrib:,.2f} to {row['name']}!")
+            col = cols[i % 3] # This cycles through column 1, 2, 3 automatically
+            
+            with col:
+                with st.container(border=True):
+                    st.subheader(f"🏷️ {row['name']}")
+                    
+                    # 1. Parse hidden settings from the 'remark' database column
+                    remark = row['remark'] if pd.notna(row['remark']) else ""
+                    is_auto = '[Auto:True]' in remark
+                    
+                    term_match = re.search(r'\[Term:(\d+)\]', remark)
+                    term = int(term_match.group(1)) if term_match else 12
+                    term = max(1, term)
+                    
+                    monthly_contrib = row['goal_amount'] / term if term > 0 else 0
+                    
+                    # 2. Main Metrics Display
+                    st.metric("Current Saved", f"${row['balance']:,.2f}")
+                    goal_str = row['goal_date'].strftime("%b %Y") if pd.notnull(row['goal_date']) else "No Date"
+                    st.caption(f"**Target:** ${row['goal_amount']:,.2f} by {goal_str}")
+                    
+                    st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
+                    
+                    # 3. "Expected By Now" Math
+                    today = date.today()
+                    expected_bal = 0.0
+                    if pd.notnull(row['goal_date']):
+                        # Calculate elapsed months based on the target date and term
+                        months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
+                        months_elapsed = term - months_left
+                        # Cap it between 0 and the total term
+                        months_elapsed = max(0, min(term, months_elapsed)) 
+                        expected_bal = months_elapsed * monthly_contrib
+
+                    # 4. Status Indicator
+                    if is_auto:
+                        st.success(f"🔄 **Auto-Fund:** ${monthly_contrib:,.2f} / mo")
+                    else:
+                        st.info(f"⏸️ **Manual:** ${monthly_contrib:,.2f} / mo")
+                        
+                    # Compare actual vs expected
+                    if row['balance'] >= row['goal_amount'] and row['goal_amount'] > 0:
+                        st.success("🎉 Goal Reached!")
+                    elif row['balance'] < expected_bal:
+                        st.error(f"📉 Behind by ${expected_bal - row['balance']:,.2f}")
+                    else:
+                        st.success(f"🟢 On Track! (Expected: ${expected_bal:,.2f})")
+                        
+                    # 5. Editing & Manual Funding Expander
+                    with st.expander("⚙️ Edit Settings"):
+                        # Show Manual button if auto-fund is off and goal isn't reached
+                        if not is_auto and monthly_contrib > 0 and row['balance'] < row['goal_amount']:
+                            if st.button(f"➕ Fund Now (${monthly_contrib:,.2f})", key=f"fund_{row['id']}", use_container_width=True):
+                                # Prevent over-funding manually
+                                amt_to_add = min(monthly_contrib, row['goal_amount'] - row['balance'])
+                                add_transaction(today, amt_to_add, f"Manual Envelope Funding: {row['name']}", "Virtual Funding", None, row['id'], "Fund", "Manual envelope funding")
+                                clear_cache()
+                                st.rerun()
+                            st.divider()
+                                
+                        new_goal = st.number_input("Goal Target ($)", min_value=0.0, value=float(row['goal_amount']), key=f"goal_{row['id']}")
+                        new_term = st.number_input("Term (Total Months)", min_value=1, value=term, key=f"term_{row['id']}")
+                        
+                        current_date = row['goal_date'] if pd.notnull(row['goal_date']) else date.today()
+                        new_date = st.date_input("Target Date", value=current_date, key=f"date_{row['id']}")
+                        
+                        new_auto = st.checkbox("☑️ Enable Auto-Funding (1st of Month)", value=is_auto, key=f"auto_{row['id']}")
+                        
+                        if st.button("💾 Save Settings", key=f"save_{row['id']}", use_container_width=True):
+                            # Clean out old tags to prevent duplicates
+                            clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
+                            clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
+                            
+                            # Inject the new hidden tags
+                            new_tags = f"[Term:{new_term}] [Auto:{new_auto}]"
+                            final_remark = f"{new_tags} {clean_remark}".strip()
+                            
+                            supabase.table('accounts').update({
+                                'goal_amount': new_goal,
+                                'goal_date': str(new_date),
+                                'remark': final_remark
+                            }).eq('id', row['id']).execute()
+                            
                             clear_cache()
                             st.rerun()
-                    elif row['balance'] >= row['goal_amount'] and row['goal_amount'] > 0:
-                        st.success("🎉 Goal Reached!")
-                    else:
-                        st.info("ℹ️ Set a Goal Target and Target Date below to calculate monthly funding.")
-                        
-                    st.divider()
-                    
-                    # ON-PAGE EDITING 
-                    st.write("**Edit Goal Settings**")
-                    c_edit1, c_edit2 = st.columns(2)
-                    new_goal = c_edit1.number_input("Goal Target ($)", min_value=0.0, value=float(row['goal_amount']), key=f"goal_{row['id']}")
-                    
-                    current_date = row['goal_date'] if pd.notnull(row['goal_date']) else date.today()
-                    new_date = c_edit2.date_input("Target Date", value=current_date, key=f"date_{row['id']}")
-                    
-                    if st.button("💾 Save Settings", key=f"save_{row['id']}"):
-                        supabase.table('accounts').update({
-                            'goal_amount': new_goal,
-                            'goal_date': str(new_date)
-                        }).eq('id', row['id']).execute()
-                        
-                        clear_cache()
-                        st.success("Goal Updated!")
-                        st.rerun()
     else:
         st.info("No Sinking Funds created yet. Go to Settings to add one!")
 
