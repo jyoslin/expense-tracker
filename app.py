@@ -271,7 +271,7 @@ df_active = get_accounts(show_inactive=False)
 
 account_map = dict(zip(df_active['name'], df_active['id']))
 balance_map = dict(zip(df_active['name'], df_active['balance']))
-type_map = dict(zip(df_active['name'], df_active['type'])) # NEW: Map names to types
+type_map = dict(zip(df_active['name'], df_active['type'])) # NEW: Map names to types for the icons
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
@@ -307,15 +307,13 @@ tx_icon_map = {
     "Transfer": icon_tx, "Increase Loan": "📉"
 }
 
-# UPGRADE: Helper Lambda to format dropdown text with live balances AND dynamic icons
+# UPGRADE: Formats dropdowns to display icon + name + balance, but behind the scenes returns pure name!
 def format_acc(acc_name):
     if not acc_name: return "Select Account..."
     bal = balance_map.get(acc_name, 0)
     acc_type = type_map.get(acc_name, "Bank")
     icon = icon_map.get(acc_type, "🏦")
     return f"{icon} {acc_name} (Bal: ${bal:,.2f})"
-
-# --- MENU: OVERVIEW ---
 
 # --- MENU: OVERVIEW ---
 if menu == "📊 Overview":
@@ -344,8 +342,8 @@ if menu == "📊 Overview":
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
         
-        # Apply the mapped icons to the 'type' column strings
-        df_display['type'] = df_display['type'].apply(lambda t: f"{icon_map.get(t, '')} {t}")
+        # UPGRADE: Prepend the mapped icon to the 'name' column instead of 'type'
+        df_display['name'] = df_display.apply(lambda row: f"{icon_map.get(row['type'], '')} {row['name']}", axis=1)
         
         st.dataframe(
             df_display, 
@@ -362,7 +360,7 @@ if menu == "📊 Overview":
     st.divider()
 
     st.subheader("📜 Account Statement (With Forward Projections)")
-    selected_acc_name = st.selectbox("Select Account to View Statement:", account_list, key="ledger_select")
+    selected_acc_name = st.selectbox("Select Account to View Statement:", account_list, key="ledger_select", format_func=format_acc)
     
     if selected_acc_name:
         sel_id = account_map[selected_acc_name]
