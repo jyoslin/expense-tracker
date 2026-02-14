@@ -147,7 +147,6 @@ def add_transaction(date, amount, description, type, from_acc_id, to_acc_id, cat
         "remark": remark
     }).execute()
 
-    # Supports the new Virtual Expense and Virtual Funding logic safely without double-counting later
     if type in ["Expense", "Virtual Expense"]: update_balance(from_acc_id, -amount)
     elif type in ["Income", "Virtual Funding"]: update_balance(to_acc_id, amount)
     elif type == "Increase Loan": update_balance(to_acc_id, -amount) 
@@ -165,7 +164,6 @@ def delete_transaction(tx_id):
     tx = tx_data[0]
     remark = tx.get('remark') or ""
     
-    # 1. Check if this is part of a 2-part transaction (like Custodial or Sinking Fund)
     batch_id = None
     if "[Batch:" in remark:
         start = remark.find("[Batch:")
@@ -173,13 +171,11 @@ def delete_transaction(tx_id):
         if end != -1:
             batch_id = remark[start:end+1]
             
-    # 2. Fetch all linked transactions
     if batch_id:
         to_delete = supabase.table('transactions').select("*").ilike('remark', f'%{batch_id}%').execute().data
     else:
         to_delete = [tx]
         
-    # 3. Delete them all and restore balances
     for t in to_delete:
         amt = float(t['amount'])
         t_type = t['type']
@@ -210,12 +206,10 @@ def run_auto_funder():
     accounts = supabase.table('accounts').select("*").eq('type', 'Sinking Fund').execute().data
     
     for acc in accounts:
-        # Skip if already automatically funded this month
         if acc['id'] in funded_account_ids:
             continue
         
         remark = acc.get('remark') or ""
-        # Skip if the Auto-Fund checkbox is NOT ticked
         if '[Auto:True]' not in remark:
             continue
             
@@ -225,15 +219,12 @@ def run_auto_funder():
         if goal_amount <= 0 or balance >= goal_amount:
             continue
             
-        # Extract the saved Term, default to 12 if not found
         term_match = re.search(r'\[Term:(\d+)\]', remark)
         term = int(term_match.group(1)) if term_match else 12
         term = max(1, term) 
         
-        # Fixed Monthly Commitment
         monthly_contrib = goal_amount / term
         
-        # Prevent over-funding on the very last month
         if balance + monthly_contrib > goal_amount:
             monthly_contrib = goal_amount - balance
         
@@ -253,10 +244,14 @@ if 'auto_funded' not in st.session_state:
     run_auto_funder()
     st.session_state['auto_funded'] = True
 
+
 # --- 3. APP START ---
 st.title("💰 My Wealth Manager")
 df_active = get_accounts(show_inactive=False)
+
+# Helper Maps for clean UI
 account_map = dict(zip(df_active['name'], df_active['id']))
+balance_map = dict(zip(df_active['name'], df_active['balance']))
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
@@ -264,7 +259,7 @@ expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Custodial', '
 
 # --- SIDEBAR NAVIGATION ---
 st.sidebar.title("Navigation")
-menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings"])
+menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📈 Reports", "📅 Schedule", "⚙️ Settings"])
 
 # --- MENU: OVERVIEW ---
 if menu == "📊 Overview":
@@ -273,21 +268,15 @@ if menu == "📊 Overview":
         df_calc = df_active.copy()
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
         
-        # 1. Net Worth (All tracked assets & liabilities)
         net_worth = df_calc[df_calc['include_net_worth'] == True]['sgd_value'].sum()
-        
-        # 2. Liquid Assets (Net Worth MINUS Custodial)
         custodial = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Custodial')]['sgd_value'].sum()
         liquid = net_worth - custodial
-        
-        # 3. Discretionary Cash (Liquid MINUS Sinking Funds)
         sinking_funds = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Sinking Fund')]['sgd_value'].sum()
         discretionary = liquid - sinking_funds
         
     else:
         net_worth, liquid, discretionary = 0, 0, 0
     
-    # NEW: 3-Tier Dashboard
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Net Worth (SGD)", f"${net_worth:,.2f}", help="Total wealth including all assets minus liabilities.") 
     c2.metric("Liquid Assets (SGD)", f"${liquid:,.2f}", help="Net worth MINUS Custodial accounts (money that is actually yours).")
@@ -317,13 +306,14 @@ if menu == "📊 Overview":
     
     if selected_acc_name:
         sel_id = account_map[selected_acc_name]
+        # UPGRADE: Sort by Date AND ID descending
         txs = supabase.table('transactions').select("*") \
             .or_(f"from_account_id.eq.{sel_id},to_account_id.eq.{sel_id}") \
-            .order("date", desc=True).limit(50).execute().data
+            .order("date", desc=True).order("id", desc=True).limit(50).execute().data
             
         if txs:
             df_tx = pd.DataFrame(txs)
-            id_to_name = {v: k for k, v in account_map.items()} # Fast lookup for transfer accounts
+            id_to_name = {v: k for k, v in account_map.items()} 
             view_data = []
             
             for _, row in df_tx.iterrows():
@@ -332,7 +322,6 @@ if menu == "📊 Overview":
                 amt = row['amount']
                 linked_info = ""
                 
-                # Figure out what to show in the "Linked / Notes" column
                 if row['type'] == 'Transfer':
                     amt = amt if is_inflow else -amt
                     other_acc_id = row['from_account_id'] if is_inflow else row['to_account_id']
@@ -341,7 +330,6 @@ if menu == "📊 Overview":
                 else:
                     if row['type'] in ['Expense', 'Virtual Expense', 'Increase Loan']:
                         amt = -amt 
-                    # Clean the hidden Batch ID out of the remark so it looks nice
                     raw_remark = row.get('remark') or ""
                     linked_info = raw_remark.split(' [Batch:')[0].strip()
                 
@@ -377,6 +365,7 @@ if menu == "📊 Overview":
         else:
             st.info("No recent transactions found.")
 
+
 # --- MENU: ENTRY ---
 elif menu == "📝 Entry":
     st.header("📝 New Transaction")
@@ -393,7 +382,6 @@ elif menu == "📝 Entry":
         c1, c2 = st.columns(2)
         tx_date = c1.date_input("Date", datetime.today())
         
-        # Create empty variables to prevent code crashes during validation
         f_acc = t_acc = acc1 = acc2 = cust_acc = bank_acc = sf_acc = category = None
         amt = amt1 = amt2 = amt_bank = 0.0
         
@@ -402,13 +390,16 @@ elif menu == "📝 Entry":
             col_a, col_b = st.columns(2)
             with col_a:
                 acc1 = st.selectbox("Source 1", expense_src_accounts, index=None, placeholder="Select Account...")
+                if acc1: st.caption(f"Current Balance: **${balance_map.get(acc1, 0):,.2f}**")
                 amt1 = st.number_input("Amount 1", min_value=0.0, format="%.2f")
             with col_b:
                 acc2 = st.selectbox("Source 2", expense_src_accounts, index=None, placeholder="Select Account...")
+                if acc2: st.caption(f"Current Balance: **${balance_map.get(acc2, 0):,.2f}**")
                 amt2 = st.number_input("Amount 2", min_value=0.0, format="%.2f")
         
         elif t_type == "Expense":
             f_acc = st.selectbox("Paid From", expense_src_accounts, index=None, placeholder="Select Account...")
+            if f_acc: c1.caption(f"Current Balance: **${balance_map.get(f_acc, 0):,.2f}**")
             amt = c2.number_input("Amount", min_value=0.01)
 
         elif t_type == "Custodial Expense":
@@ -418,7 +409,10 @@ elif menu == "📝 Entry":
             bank_opts = df_active[df_active['type']=='Bank']['name']
             
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts, index=None, placeholder="Select Custodial...")
+            if cust_acc: c_a.caption(f"Current Envelope: **${balance_map.get(cust_acc, 0):,.2f}**")
+            
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts, index=None, placeholder="Select Bank...")
+            if bank_acc: c_b.caption(f"Current Balance: **${balance_map.get(bank_acc, 0):,.2f}**")
             
             amt = c1.number_input("Total Custodial Deduction", min_value=0.01)
             amt_bank = c2.number_input("Actual Amount Paid from Bank", min_value=0.00)
@@ -428,8 +422,13 @@ elif menu == "📝 Entry":
             c_a, c_b = st.columns(2)
             cust_opts = df_active[df_active['type']=='Custodial']['name']
             bank_opts = df_active[df_active['type']=='Bank']['name']
+            
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts, index=None, placeholder="Select Custodial...")
+            if cust_acc: c_a.caption(f"Current Envelope: **${balance_map.get(cust_acc, 0):,.2f}**")
+            
             bank_acc = c_b.selectbox("Deposit to Bank (Actual)", bank_opts, index=None, placeholder="Select Bank...")
+            if bank_acc: c_b.caption(f"Current Balance: **${balance_map.get(bank_acc, 0):,.2f}**")
+            
             amt = c2.number_input("Total Amount", min_value=0.01)
 
         elif t_type == "Sinking Fund Expense":
@@ -437,18 +436,28 @@ elif menu == "📝 Entry":
             c_a, c_b = st.columns(2)
             sf_opts = df_active[df_active['type']=='Sinking Fund']['name']
             bank_opts = df_active[df_active['type']=='Bank']['name']
+            
             sf_acc = c_a.selectbox("Deduct from Virtual Envelope", sf_opts, index=None, placeholder="Select Sinking Fund...")
+            if sf_acc: c_a.caption(f"Current Envelope: **${balance_map.get(sf_acc, 0):,.2f}**")
+            
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts, index=None, placeholder="Select Bank...")
+            if bank_acc: c_b.caption(f"Current Balance: **${balance_map.get(bank_acc, 0):,.2f}**")
+            
             amt = c2.number_input("Total Amount", min_value=0.01)
 
         elif t_type == "Income":
             t_acc = st.selectbox("Deposit To", account_list, index=None, placeholder="Select Account...")
+            if t_acc: c1.caption(f"Current Balance: **${balance_map.get(t_acc, 0):,.2f}**")
             amt = c2.number_input("Amount", min_value=0.01)
 
         elif t_type == "Transfer":
             c_a, c_b = st.columns(2)
             f_acc = c_a.selectbox("From", non_loan_accounts, index=None, placeholder="Select Source...")
+            if f_acc: c_a.caption(f"Current Balance: **${balance_map.get(f_acc, 0):,.2f}**")
+            
             t_acc = c_b.selectbox("To", account_list, index=None, placeholder="Select Destination...")
+            if t_acc: c_b.caption(f"Current Balance: **${balance_map.get(t_acc, 0):,.2f}**")
+            
             amt = c2.number_input("Amount", min_value=0.01)
             
         elif t_type == "Increase Loan":
@@ -457,6 +466,7 @@ elif menu == "📝 Entry":
                 st.warning("No Loan accounts found.")
             else:
                 t_acc = st.selectbox("Select Loan Account", loan_opts, index=None, placeholder="Select Loan...")
+                if t_acc: c1.caption(f"Current Debt: **${balance_map.get(t_acc, 0):,.2f}**")
             amt = c2.number_input("Amount to Add to Loan", min_value=0.01)
 
         df_cats_full = get_categories()
@@ -469,7 +479,7 @@ elif menu == "📝 Entry":
             else:
                 cat_options = df_cats_full[df_cats_full['type'].isin(['Expense', 'Fund'])]['name'].tolist()
                 
-        category = st.selectbox("Category", cat_options, index=None, placeholder="Select Category...")
+        category = st.selectbox("Category", cat_options, index=None, placeholder="Select Category (Optional)...")
         
         desc = st.text_input("Description")
         remark = st.text_area("Notes", height=2)
@@ -477,7 +487,6 @@ elif menu == "📝 Entry":
         submitted = st.form_submit_button("Submit Transaction")
         
         if submitted:
-            # STRICT VALIDATION CHECKS
             if t_type == "Expense" and is_split and (not acc1 or not acc2):
                 st.error("❌ Please select both Source accounts.")
             elif t_type == "Expense" and not is_split and not f_acc:
@@ -492,15 +501,14 @@ elif menu == "📝 Entry":
                 st.error("❌ Please select both 'From' and 'To' accounts.")
             elif t_type == "Increase Loan" and not t_acc:
                 st.error("❌ Please select a Loan account.")
-            elif not category:
-                st.error("❌ Please select a Category.")
             elif t_type == "Increase Loan" and not desc.strip():
                 st.error("❌ Description is MANDATORY when increasing a loan.")
             else:
-                # ALL VALID - PROCEED WITH SAVE
                 import time
                 batch_id = f" [Batch:{int(time.time() * 1000)}]"
-                final_cat = category
+                
+                # UPGRADE: Fallback to "Others" if category left blank
+                final_cat = category if category else "Others"
                 
                 if t_type == "Expense" and is_split:
                     if amt1 > 0: add_transaction(tx_date, amt1, f"{desc} (Split 1)", "Expense", account_map[acc1], None, final_cat, remark + batch_id)
@@ -530,6 +538,7 @@ elif menu == "📝 Entry":
                 st.toast("Transaction Saved!", icon="✅")
                 clear_cache()
 
+
 # --- MENU: GOALS ---
 elif menu == "🎯 Goals":
     st.header("🎯 Sinking Funds Dashboard")
@@ -537,23 +546,32 @@ elif menu == "🎯 Goals":
     
     goals = df_active[df_active['type'] == 'Sinking Fund']
     if not goals.empty:
-        # Total Summary Display
+        
+        # 1. Calculate Total Monthly Commitment BEFORE displaying the metrics
+        total_monthly_commitment = 0.0
+        for _, row in goals.iterrows():
+            remark = row['remark'] if pd.notna(row['remark']) else ""
+            if '[Auto:True]' in remark:
+                term_match = re.search(r'\[Term:(\d+)\]', remark)
+                term = int(term_match.group(1)) if term_match else 12
+                term = max(1, term)
+                total_monthly_commitment += (row['goal_amount'] / term)
+        
+        # 2. Display the dual-metric header
+        col_t1, col_t2 = st.columns(2)
         total_saved = goals['balance'].sum()
-        st.metric("Total Virtual Funds Saved", f"${total_saved:,.2f}")
+        col_t1.metric("Total Virtual Funds Saved", f"${total_saved:,.2f}")
+        col_t2.metric("Total Auto-Fund Commitment", f"${total_monthly_commitment:,.2f} / month")
         st.divider()
 
-        # Create a 3-column Grid Layout
         cols = st.columns(3)
-        
-        # Display Each Individual Fund Card inside the grid
         for i, (index, row) in enumerate(goals.iterrows()):
-            col = cols[i % 3] # This cycles through column 1, 2, 3 automatically
+            col = cols[i % 3] 
             
             with col:
                 with st.container(border=True):
                     st.subheader(f"🏷️ {row['name']}")
                     
-                    # 1. Parse hidden settings from the 'remark' database column
                     remark = row['remark'] if pd.notna(row['remark']) else ""
                     is_auto = '[Auto:True]' in remark
                     
@@ -563,31 +581,25 @@ elif menu == "🎯 Goals":
                     
                     monthly_contrib = row['goal_amount'] / term if term > 0 else 0
                     
-                    # 2. Main Metrics Display
                     st.metric("Current Saved", f"${row['balance']:,.2f}")
                     goal_str = row['goal_date'].strftime("%b %Y") if pd.notnull(row['goal_date']) else "No Date"
                     st.caption(f"**Target:** ${row['goal_amount']:,.2f} by {goal_str}")
                     
                     st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
                     
-                    # 3. "Expected By Now" Math
                     today = date.today()
                     expected_bal = 0.0
                     if pd.notnull(row['goal_date']):
-                        # Calculate elapsed months based on the target date and term
                         months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
                         months_elapsed = term - months_left
-                        # Cap it between 0 and the total term
                         months_elapsed = max(0, min(term, months_elapsed)) 
                         expected_bal = months_elapsed * monthly_contrib
 
-                    # 4. Status Indicator
                     if is_auto:
                         st.success(f"🔄 **Auto-Fund:** ${monthly_contrib:,.2f} / mo")
                     else:
                         st.info(f"⏸️ **Manual:** ${monthly_contrib:,.2f} / mo")
                         
-                    # Compare actual vs expected
                     if row['balance'] >= row['goal_amount'] and row['goal_amount'] > 0:
                         st.success("🎉 Goal Reached!")
                     elif row['balance'] < expected_bal:
@@ -595,18 +607,20 @@ elif menu == "🎯 Goals":
                     else:
                         st.success(f"🟢 On Track! (Expected: ${expected_bal:,.2f})")
                         
-                    # 5. Editing & Manual Funding Expander
                     with st.expander("⚙️ Edit Settings"):
-                        # Show Manual button if auto-fund is off and goal isn't reached
+                        # UPGRADE: Custom Number Input for Manual Funding
                         if not is_auto and monthly_contrib > 0 and row['balance'] < row['goal_amount']:
-                            if st.button(f"➕ Fund Now (${monthly_contrib:,.2f})", key=f"fund_{row['id']}", use_container_width=True):
-                                # Prevent over-funding manually
-                                amt_to_add = min(monthly_contrib, row['goal_amount'] - row['balance'])
+                            st.write("**Manual Funding**")
+                            default_fund = min(monthly_contrib, row['goal_amount'] - row['balance'])
+                            amt_to_add = st.number_input("Amount to Fund Now ($)", min_value=0.01, max_value=float(row['goal_amount'] - row['balance']), value=float(default_fund), key=f"amt_{row['id']}")
+                            
+                            if st.button("➕ Submit Funding", key=f"fund_{row['id']}", use_container_width=True):
                                 add_transaction(today, amt_to_add, f"Manual Envelope Funding: {row['name']}", "Virtual Funding", None, row['id'], "Fund", "Manual envelope funding")
                                 clear_cache()
                                 st.rerun()
                             st.divider()
                                 
+                        st.write("**Goal Configuration**")
                         new_goal = st.number_input("Goal Target ($)", min_value=0.0, value=float(row['goal_amount']), key=f"goal_{row['id']}")
                         new_term = st.number_input("Term (Total Months)", min_value=1, value=term, key=f"term_{row['id']}")
                         
@@ -616,11 +630,9 @@ elif menu == "🎯 Goals":
                         new_auto = st.checkbox("☑️ Enable Auto-Funding (1st of Month)", value=is_auto, key=f"auto_{row['id']}")
                         
                         if st.button("💾 Save Settings", key=f"save_{row['id']}", use_container_width=True):
-                            # Clean out old tags to prevent duplicates
                             clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
                             clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
                             
-                            # Inject the new hidden tags
                             new_tags = f"[Term:{new_term}] [Auto:{new_auto}]"
                             final_remark = f"{new_tags} {clean_remark}".strip()
                             
@@ -635,6 +647,77 @@ elif menu == "🎯 Goals":
     else:
         st.info("No Sinking Funds created yet. Go to Settings to add one!")
 
+
+# --- MENU: REPORTS ---
+elif menu == "📈 Reports":
+    st.header("📈 Reports & Analytics")
+    st.write("View detailed spending or income by category over time.")
+    
+    with st.form("report_form"):
+        col1, col2, col3 = st.columns(3)
+        start_date = col1.date_input("Start Date", date.today().replace(day=1))
+        end_date = col2.date_input("End Date", date.today())
+        
+        cat_df = get_categories()
+        all_cats = ["All Categories"] + cat_df['name'].tolist() if not cat_df.empty else ["All Categories"]
+        selected_cat = col3.selectbox("Category", all_cats)
+        
+        generate = st.form_submit_button("Generate Report")
+        
+    if generate:
+        query = supabase.table('transactions').select('*').gte('date', start_date).lte('date', end_date)
+        if selected_cat != "All Categories":
+            query = query.eq('category', selected_cat)
+        
+        report_txs = query.order('date', desc=True).order('id', desc=True).execute().data
+        
+        if report_txs:
+            df_report = pd.DataFrame(report_txs)
+            
+            total_expense = df_report[df_report['type'].isin(['Expense', 'Virtual Expense'])]['amount'].sum()
+            total_income = df_report[df_report['type'].isin(['Income', 'Virtual Funding'])]['amount'].sum()
+            
+            st.subheader(f"Summary: {selected_cat}")
+            c_rep1, c_rep2 = st.columns(2)
+            c_rep1.metric("Total Expense in Period", f"${total_expense:,.2f}")
+            c_rep2.metric("Total Income in Period", f"${total_income:,.2f}")
+            
+            st.divider()
+            
+            id_to_name = {v: k for k, v in account_map.items()}
+            view_data = []
+            
+            for _, row in df_report.iterrows():
+                f_name = id_to_name.get(row['from_account_id'], "")
+                t_name = id_to_name.get(row['to_account_id'], "")
+                
+                acc_involved = ""
+                if f_name and t_name: acc_involved = f"{f_name} ➔ {t_name}"
+                elif f_name: acc_involved = f"From: {f_name}"
+                elif t_name: acc_involved = f"To: {t_name}"
+                
+                amt = row['amount']
+                if row['type'] in ['Expense', 'Virtual Expense', 'Increase Loan']:
+                    amt = -amt 
+                    
+                raw_remark = row.get('remark') or ""
+                clean_remark = raw_remark.split(' [Batch:')[0].strip()
+                
+                view_data.append({
+                    "Date": row['date'],
+                    "Description": row['description'],
+                    "Category": row['category'],
+                    "Amount": amt,
+                    "Accounts": acc_involved,
+                    "Type": row['type'],
+                    "Notes": clean_remark
+                })
+                
+            st.dataframe(pd.DataFrame(view_data), hide_index=True, use_container_width=True)
+        else:
+            st.info("No transactions found for this date range and category.")
+
+
 # --- MENU: SCHEDULE ---
 elif menu == "📅 Schedule":
     st.header("📅 Manage Future Payments")
@@ -648,29 +731,37 @@ elif menu == "📅 Schedule":
             s_date = c3.date_input("Start Date", datetime.today())
             
             s_cat_opts = get_categories()['name'].tolist()
-            s_cat = st.selectbox("Category", [""] + s_cat_opts)
+            s_cat = st.selectbox("Category", s_cat_opts, index=None, placeholder="Select Category (Optional)...")
             s_manual = st.checkbox("🔔 Manual Reminder?", value=False)
             s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
             
             s_from, s_to = None, None
-            if s_type == "Expense": s_from = st.selectbox("From Account", non_loan_accounts)
-            elif s_type == "Income": s_to = st.selectbox("To Account", account_list)
+            if s_type == "Expense": s_from = st.selectbox("From Account", non_loan_accounts, index=None, placeholder="Select Account...")
+            elif s_type == "Income": s_to = st.selectbox("To Account", account_list, index=None, placeholder="Select Account...")
             elif s_type == "Transfer":
-                s_from = st.selectbox("From", non_loan_accounts, key="s_f")
-                s_to = st.selectbox("To", account_list, key="s_t")
+                s_from = st.selectbox("From", non_loan_accounts, key="s_f", index=None, placeholder="Select Source...")
+                s_to = st.selectbox("To", account_list, key="s_t", index=None, placeholder="Select Destination...")
                 
             if st.form_submit_button("Schedule It"):
-                final_sch_cat = s_cat if s_cat.strip() != "" else "Others"
-                f_id = account_map.get(s_from)
-                t_id = account_map.get(s_to)
-                supabase.table('schedule').insert({
-                    "description": s_desc, "amount": s_amount, "type": s_type, 
-                    "from_account_id": f_id, "to_account_id": t_id, 
-                    "frequency": s_freq, "next_run_date": str(s_date),
-                    "is_manual": s_manual, "category": final_sch_cat
-                }).execute()
-                st.success("Scheduled!")
-                clear_cache()
+                if s_type == "Expense" and not s_from:
+                    st.error("❌ Please select a 'From Account'.")
+                elif s_type == "Income" and not s_to:
+                    st.error("❌ Please select a 'To Account'.")
+                elif s_type == "Transfer" and (not s_from or not s_to):
+                    st.error("❌ Please select both Source and Destination accounts.")
+                else:
+                    final_sch_cat = s_cat if s_cat else "Others"
+                    f_id = account_map.get(s_from) if s_from else None
+                    t_id = account_map.get(s_to) if s_to else None
+                    
+                    supabase.table('schedule').insert({
+                        "description": s_desc, "amount": s_amount, "type": s_type, 
+                        "from_account_id": f_id, "to_account_id": t_id, 
+                        "frequency": s_freq, "next_run_date": str(s_date),
+                        "is_manual": s_manual, "category": final_sch_cat
+                    }).execute()
+                    st.success("Scheduled!")
+                    clear_cache()
 
     upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
     if upcoming:
