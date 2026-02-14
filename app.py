@@ -689,6 +689,7 @@ elif menu == "🎯 Goals":
     
     goals_raw = df_active[df_active['type'] == 'Sinking Fund'].copy()
     if not goals_raw.empty:
+        # Sort Sinking Funds by Closest Due Date
         goals_raw['goal_date_sort'] = pd.to_datetime(goals_raw['goal_date'])
         goals = goals_raw.sort_values(by='goal_date_sort', na_position='last')
         
@@ -722,10 +723,9 @@ elif menu == "🎯 Goals":
                     term = int(term_match.group(1)) if term_match else 12
                     term = max(1, term)
                     
+                    # Clean the remark for display and editing
                     clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
                     clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
-                    if clean_remark:
-                        st.caption(f"📝 *{clean_remark}*")
                     
                     monthly_contrib = row['goal_amount'] / term if term > 0 else 0
                     
@@ -735,11 +735,18 @@ elif menu == "🎯 Goals":
                     
                     st.progress(min(row['balance'] / (row['goal_amount'] or 1), 1.0))
                     
+                    # --- FIXED MATH LOGIC ---
                     today = date.today()
                     expected_bal = 0.0
                     if pd.notnull(row['goal_date']):
+                        # Calculate full calendar months between now and target
                         months_left = (row['goal_date'].year - today.year) * 12 + (row['goal_date'].month - today.month)
-                        months_elapsed = term - months_left
+                        
+                        # NEW: Adjust elapsed to be inclusive of the current month
+                        # If months_left is 12 and term is 12, elapsed becomes 1.
+                        months_elapsed = (term - months_left) + 1
+                        
+                        # Constraints: Cannot be less than 0 or more than the total term
                         months_elapsed = max(0, min(term, months_elapsed)) 
                         expected_bal = months_elapsed * monthly_contrib
 
@@ -774,7 +781,7 @@ elif menu == "🎯 Goals":
                         current_date = row['goal_date'] if pd.notnull(row['goal_date']) else date.today()
                         new_date = st.date_input("Target Date", value=current_date, key=f"date_{row['id']}")
                         
-                        new_notes = st.text_input("Notes (e.g. Final Policy End Date)", value=clean_remark, key=f"note_{row['id']}")
+                        new_notes = st.text_input("Notes", value=clean_remark, key=f"note_{row['id']}")
                         new_auto = st.checkbox("☑️ Enable Auto-Funding (1st of Month)", value=is_auto, key=f"auto_{row['id']}")
                         
                         if st.button("💾 Save Settings", key=f"save_{row['id']}", use_container_width=True):
