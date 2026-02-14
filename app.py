@@ -421,7 +421,7 @@ if menu == "📊 Overview":
                 use_container_width=True, 
                 hide_index=True,
                 on_select="rerun",
-                selection_mode="single_row",
+                selection_mode="single-row",
                 column_config={
                     "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
                     "Running Balance": st.column_config.NumberColumn("Running Balance", format="$%.2f")
@@ -813,7 +813,7 @@ elif menu == "📅 Schedule":
             hide_index=True, 
             use_container_width=True,
             on_select="rerun",
-            selection_mode="single_row"
+            selection_mode="single-row"
         )
         
         st.write("### 🗑️ Cancel Scheduled Item")
