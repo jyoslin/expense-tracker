@@ -318,23 +318,53 @@ def format_acc(acc_name):
 # --- MENU: OVERVIEW ---
 if menu == "📊 Overview":
     st.header("📊 Overview")
+    
     if not df_active.empty:
         df_calc = df_active.copy()
+        # Ensure all balances are converted to SGD
         df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
         
-        net_worth = df_calc[df_calc['include_net_worth'] == True]['sgd_value'].sum()
-        custodial = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Custodial')]['sgd_value'].sum()
-        liquid = net_worth - custodial
-        sinking_funds = df_calc[(df_calc['include_net_worth'] == True) & (df_calc['type'] == 'Sinking Fund')]['sgd_value'].sum()
-        discretionary = liquid - sinking_funds
+        # 1. Calculate individual category totals
+        bank_tot = df_calc[df_calc['type'] == 'Bank']['sgd_value'].sum()
+        cc_tot = df_calc[df_calc['type'] == 'Credit Card']['sgd_value'].sum()
+        custodial_tot = df_calc[df_calc['type'] == 'Custodial']['sgd_value'].sum()
+        sf_tot = df_calc[df_calc['type'] == 'Sinking Fund']['sgd_value'].sum()
+        
+        # 2. Calculate combined metrics based on custom formulas
+        net_worth = bank_tot - cc_tot - custodial_tot + sf_tot
+        liquid = bank_tot - cc_tot - custodial_tot - sf_tot
         
     else:
-        net_worth, liquid, discretionary = 0, 0, 0
+        bank_tot = cc_tot = custodial_tot = sf_tot = 0
+        net_worth = liquid = 0
     
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Net Worth (SGD)", f"${net_worth:,.2f}", help="Total wealth including all assets minus liabilities.") 
-    c2.metric("Liquid Assets (SGD)", f"${liquid:,.2f}", help="Net worth MINUS Custodial accounts (money that is actually yours).")
-    c3.metric("Discretionary Cash (SGD)", f"${discretionary:,.2f}", help="Liquid Assets MINUS Sinking Funds. This is free cash you can spend today with zero guilt.")
+    # --- UI DISPLAY ---
+    
+    # Row 1: The Four Base Totals
+    st.subheader("🏦 Account Totals")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Bank Total", f"${bank_tot:,.2f}")
+    c2.metric("Credit Card Total", f"${cc_tot:,.2f}")
+    c3.metric("Custodial Total", f"${custodial_tot:,.2f}")
+    c4.metric("Sinking Fund Total", f"${sf_tot:,.2f}")
+    
+    st.divider()
+    
+    # Row 2: The Calculated Metrics & Formulas
+    st.subheader("📈 Wealth Metrics")
+    m1, m2 = st.columns(2)
+    
+    # Dynamically build the formula strings to show the live math
+    nw_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) + Sinking Fund (${sf_tot:,.2f})"
+    la_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) - Sinking Fund (${sf_tot:,.2f})"
+    
+    with m1:
+        st.metric("Total Net Worth (SGD)", f"${net_worth:,.2f}")
+        st.caption(f"**Calculation:** {nw_formula}")
+        
+    with m2:
+        st.metric("Liquid Assets (SGD)", f"${liquid:,.2f}")
+        st.caption(f"**Calculation:** {la_formula}")
     
     st.divider()
 
