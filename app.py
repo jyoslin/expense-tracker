@@ -309,7 +309,7 @@ if menu == "📊 Overview":
     
     st.divider()
 
-st.subheader("💳 Current Balances")
+    st.subheader("💳 Current Balances")
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
         
