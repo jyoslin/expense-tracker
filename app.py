@@ -460,25 +460,61 @@ if menu == "📊 Overview":
                         st.write(f"**Target:** Past Transaction - {selected_row['Description']}")
                         st.write(f"**Date:** {selected_row['Date']}")
                         
-                        is_batch = False
-                        tx_data = supabase.table('transactions').select("remark").eq('id', real_id).execute().data
-                        if tx_data and "[Batch:" in (tx_data[0].get('remark') or ""):
-                            is_batch = True
+                        # Fetch the exact details of the targeted transaction
+                        tx_data_res = supabase.table('transactions').select("*").eq('id', real_id).execute().data
+                        if tx_data_res:
+                            target_tx = tx_data_res[0]
+                            remark = target_tx.get('remark') or ""
                             
-                        if is_batch:
-                            st.write("**Impact:** *Note: This is a batched transaction.* Deleting it will reverse **BOTH** the actual bank payment and the virtual envelope deduction.")
-                        else:
-                            amt = selected_row["Amount"]
-                            st.write(f"**Impact:** The transaction will be erased and **${abs(amt):,.2f}** will be restored to your accounts.")
+                            # Check if it's a batched transaction
+                            batch_id = None
+                            if "[Batch:" in remark:
+                                start = remark.find("[Batch:")
+                                end = remark.find("]", start)
+                                if end != -1:
+                                    batch_id = remark[start:end+1]
                             
+                            id_to_name = {v: k for k, v in account_map.items()}
+                            
+                            if batch_id:
+                                st.write("**Impact:** This is a batched transaction. Deleting it will reverse multiple entries:")
+                                batched_txs = supabase.table('transactions').select("*").ilike('remark', f'%{batch_id}%').execute().data
+                                
+                                for b_tx in batched_txs:
+                                    b_amt = float(b_tx['amount'])
+                                    b_type = b_tx['type']
+                                    f_acc = id_to_name.get(b_tx['from_account_id'], "Unknown Account")
+                                    t_acc = id_to_name.get(b_tx['to_account_id'], "Unknown Account")
+                                    
+                                    if b_type in ["Expense", "Virtual Expense"]:
+                                        st.write(f"* 🟢 **${b_amt:,.2f}** will be **added back** to {f_acc}.")
+                                    elif b_type in ["Income", "Virtual Funding"]:
+                                        st.write(f"* 🔴 **${b_amt:,.2f}** will be **deducted** from {t_acc}.")
+                                    elif b_type == "Transfer":
+                                        st.write(f"* 🔄 **${b_amt:,.2f}** will be **returned** from {t_acc} to {f_acc}.")
+                            else:
+                                t_type = target_tx['type']
+                                amt = float(target_tx['amount'])
+                                f_acc = id_to_name.get(target_tx['from_account_id'], "Unknown Account")
+                                t_acc = id_to_name.get(target_tx['to_account_id'], "Unknown Account")
+                                
+                                if t_type in ["Expense", "Virtual Expense"]:
+                                    st.write(f"**Impact:** 🟢 **${amt:,.2f}** will be **added back** to {f_acc}.")
+                                elif t_type in ["Income", "Virtual Funding"]:
+                                    st.write(f"**Impact:** 🔴 **${amt:,.2f}** will be **deducted** from {t_acc}.")
+                                elif t_type == "Transfer":
+                                    st.write(f"**Impact:** 🔄 **${amt:,.2f}** will be **returned** from {t_acc} to {f_acc}.")
+                                elif t_type == "Increase Loan":
+                                    st.write(f"**Impact:** 🟢 **${amt:,.2f}** debt will be **removed** from {t_acc}.")
+                                else:
+                                    st.write(f"**Impact:** The transaction will be erased and **${amt:,.2f}** will be restored to your accounts.")
+                                
                         if st.button("🚨 Confirm Delete Transaction", use_container_width=True):
                             delete_transaction(real_id)
                             st.success("Transaction deleted and balances restored!")
                             st.rerun()
             else:
                 st.info("👆 **Click on any row** in the table above to view deletion options and impact analysis.")
-        else:
-            st.info("No recent or scheduled transactions found.")
 
 
 # --- MENU: ENTRY ---
