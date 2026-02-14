@@ -309,21 +309,38 @@ if menu == "📊 Overview":
     
     st.divider()
 
-    st.subheader("💳 Current Balances")
+st.subheader("💳 Current Balances")
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
+        
+        # 1. Define a coloring function based on the account 'type'
+        def highlight_account_type(row):
+            # Define custom background colors using RGBA (soft, transparent colors)
+            color_map = {
+                "Bank": "background-color: rgba(40, 167, 69, 0.15)",         # Light Green
+                "Credit Card": "background-color: rgba(220, 53, 69, 0.15)",  # Light Red
+                "Custodial": "background-color: rgba(23, 162, 184, 0.15)",   # Light Blue
+                "Sinking Fund": "background-color: rgba(255, 193, 7, 0.15)", # Light Yellow
+                "Loan": "background-color: rgba(220, 53, 69, 0.3)",          # Darker Red
+                "Investment": "background-color: rgba(108, 117, 125, 0.15)"  # Light Grey
+            }
+            # Fetch the color mapped to this row's account type, default to empty
+            bg_color = color_map.get(row['type'], "")
+            
+            # Apply this color to every column in the row
+            return [bg_color] * len(row)
+            
+        # 2. Apply the styling to the dataframe using Pandas Styler
+        styled_df = df_display.style.apply(highlight_account_type, axis=1)
+
+        # 3. Render the table using the styled dataframe
         st.dataframe(
-            df_display, 
+            styled_df, 
             hide_index=True, 
             use_container_width=True,
             column_config={
                 "name": "Account Name",
-                "type": st.column_config.SelectboxColumn(
-                    "Type",
-                    options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"],
-                    # UPGRADE: Adding custom colors for each type
-                    required=True,
-                ),
+                "type": "Type", # Simplified from SelectboxColumn since st.dataframe is read-only
                 "balance": st.column_config.NumberColumn("Balance", format="%.2f"),
                 "currency": "Currency"
             }
