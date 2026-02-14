@@ -544,10 +544,12 @@ elif menu == "🎯 Goals":
     st.header("🎯 Sinking Funds Dashboard")
     st.write("Virtually set aside money for future goals without it leaving your bank account.")
     
-    goals = df_active[df_active['type'] == 'Sinking Fund']
-    if not goals.empty:
+    goals_raw = df_active[df_active['type'] == 'Sinking Fund'].copy()
+    if not goals_raw.empty:
+        # UPGRADE: Sort Sinking Funds by Closest Due Date
+        goals_raw['goal_date_sort'] = pd.to_datetime(goals_raw['goal_date'])
+        goals = goals_raw.sort_values(by='goal_date_sort', na_position='last')
         
-        # 1. Calculate Total Monthly Commitment BEFORE displaying the metrics
         total_monthly_commitment = 0.0
         for _, row in goals.iterrows():
             remark = row['remark'] if pd.notna(row['remark']) else ""
@@ -557,7 +559,6 @@ elif menu == "🎯 Goals":
                 term = max(1, term)
                 total_monthly_commitment += (row['goal_amount'] / term)
         
-        # 2. Display the dual-metric header
         col_t1, col_t2 = st.columns(2)
         total_saved = goals['balance'].sum()
         col_t1.metric("Total Virtual Funds Saved", f"${total_saved:,.2f}")
@@ -578,6 +579,10 @@ elif menu == "🎯 Goals":
                     term_match = re.search(r'\[Term:(\d+)\]', remark)
                     term = int(term_match.group(1)) if term_match else 12
                     term = max(1, term)
+                    
+                    # Clean the remark to pass it into the editable text box later
+                    clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
+                    clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
                     
                     monthly_contrib = row['goal_amount'] / term if term > 0 else 0
                     
@@ -608,7 +613,6 @@ elif menu == "🎯 Goals":
                         st.success(f"🟢 On Track! (Expected: ${expected_bal:,.2f})")
                         
                     with st.expander("⚙️ Edit Settings"):
-                        # UPGRADE: Custom Number Input for Manual Funding
                         if not is_auto and monthly_contrib > 0 and row['balance'] < row['goal_amount']:
                             st.write("**Manual Funding**")
                             default_fund = min(monthly_contrib, row['goal_amount'] - row['balance'])
@@ -627,14 +631,14 @@ elif menu == "🎯 Goals":
                         current_date = row['goal_date'] if pd.notnull(row['goal_date']) else date.today()
                         new_date = st.date_input("Target Date", value=current_date, key=f"date_{row['id']}")
                         
+                        # UPGRADE: Add Editable Notes Field directly into the expander
+                        new_notes = st.text_input("Notes (e.g. Final Policy End Date)", value=clean_remark, key=f"note_{row['id']}")
+                        
                         new_auto = st.checkbox("☑️ Enable Auto-Funding (1st of Month)", value=is_auto, key=f"auto_{row['id']}")
                         
                         if st.button("💾 Save Settings", key=f"save_{row['id']}", use_container_width=True):
-                            clean_remark = re.sub(r'\[Term:\d+\]', '', remark)
-                            clean_remark = clean_remark.replace('[Auto:True]', '').replace('[Auto:False]', '').strip()
-                            
                             new_tags = f"[Term:{new_term}] [Auto:{new_auto}]"
-                            final_remark = f"{new_tags} {clean_remark}".strip()
+                            final_remark = f"{new_tags} {new_notes}".strip()
                             
                             supabase.table('accounts').update({
                                 'goal_amount': new_goal,
