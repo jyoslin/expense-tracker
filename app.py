@@ -271,20 +271,51 @@ df_active = get_accounts(show_inactive=False)
 
 account_map = dict(zip(df_active['name'], df_active['id']))
 balance_map = dict(zip(df_active['name'], df_active['balance']))
+type_map = dict(zip(df_active['name'], df_active['type'])) # NEW: Map names to types
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
 expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Custodial', 'Sinking Fund'])]['name'].tolist() if not df_active.empty else []
 
-# UPGRADE: Helper Lambda to format dropdown text with live balances
+# --- SIDEBAR NAVIGATION & ICON MAPPING ---
+st.sidebar.title("Navigation")
+menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings", "📈 Reports"])
+
+st.sidebar.divider()
+st.sidebar.subheader("🎨 Icon Mapping")
+st.sidebar.caption("Customize account & transaction icons:")
+icon_bank = st.sidebar.text_input("Bank", "🏦")
+icon_cc = st.sidebar.text_input("Credit Card", "💳")
+icon_cust = st.sidebar.text_input("Custodial", "🛡️")
+icon_sf = st.sidebar.text_input("Sinking Fund", "🎯")
+icon_loan = st.sidebar.text_input("Loan", "📉")
+icon_inv = st.sidebar.text_input("Investment", "📈")
+
+icon_inc = st.sidebar.text_input("Income", "🟢")
+icon_exp = st.sidebar.text_input("Expense", "🔴")
+icon_tx = st.sidebar.text_input("Transfer", "🔄")
+
+icon_map = {
+    "Bank": icon_bank, "Credit Card": icon_cc, "Custodial": icon_cust,
+    "Sinking Fund": icon_sf, "Loan": icon_loan, "Investment": icon_inv
+}
+
+tx_icon_map = {
+    "Income": icon_inc, "Virtual Funding": icon_inc, 
+    "Expense": icon_exp, "Virtual Expense": icon_exp, 
+    "Sinking Fund Expense": icon_exp, "Custodial Expense": icon_exp, 
+    "Transfer": icon_tx, "Increase Loan": "📉"
+}
+
+# UPGRADE: Helper Lambda to format dropdown text with live balances AND dynamic icons
 def format_acc(acc_name):
     if not acc_name: return "Select Account..."
     bal = balance_map.get(acc_name, 0)
-    return f"{acc_name} (Bal: ${bal:,.2f})"
+    acc_type = type_map.get(acc_name, "Bank")
+    icon = icon_map.get(acc_type, "🏦")
+    return f"{icon} {acc_name} (Bal: ${bal:,.2f})"
 
-# --- SIDEBAR NAVIGATION ---
-st.sidebar.title("Navigation")
-menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings", "📈 Reports"])
+# --- MENU: OVERVIEW ---
 
 # --- MENU: OVERVIEW ---
 if menu == "📊 Overview":
@@ -313,34 +344,16 @@ if menu == "📊 Overview":
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
         
-        # 1. Define a coloring function based on the account 'type'
-        def highlight_account_type(row):
-            # Define custom background colors using RGBA (soft, transparent colors)
-            color_map = {
-                "Bank": "background-color: rgba(40, 167, 69, 0.15)",         # Light Green
-                "Credit Card": "background-color: rgba(220, 53, 69, 0.15)",  # Light Red
-                "Custodial": "background-color: rgba(23, 162, 184, 0.15)",   # Light Blue
-                "Sinking Fund": "background-color: rgba(255, 193, 7, 0.15)", # Light Yellow
-                "Loan": "background-color: rgba(220, 53, 69, 0.3)",          # Darker Red
-                "Investment": "background-color: rgba(108, 117, 125, 0.15)"  # Light Grey
-            }
-            # Fetch the color mapped to this row's account type, default to empty
-            bg_color = color_map.get(row['type'], "")
-            
-            # Apply this color to every column in the row
-            return [bg_color] * len(row)
-            
-        # 2. Apply the styling to the dataframe using Pandas Styler
-        styled_df = df_display.style.apply(highlight_account_type, axis=1)
-
-        # 3. Render the table using the styled dataframe
+        # Apply the mapped icons to the 'type' column strings
+        df_display['type'] = df_display['type'].apply(lambda t: f"{icon_map.get(t, '')} {t}")
+        
         st.dataframe(
-            styled_df, 
+            df_display, 
             hide_index=True, 
             use_container_width=True,
             column_config={
                 "name": "Account Name",
-                "type": "Type", # Simplified from SelectboxColumn since st.dataframe is read-only
+                "type": "Type",
                 "balance": st.column_config.NumberColumn("Balance", format="%.2f"),
                 "currency": "Currency"
             }
@@ -437,7 +450,10 @@ if menu == "📊 Overview":
         if view_data:
             df_view = pd.DataFrame(view_data)
             
-            # UPGRADE: Interactive Selectable Dataframe
+            # Apply the mapped icons to the 'Type' column strings
+            df_view['Type'] = df_view['Type'].apply(lambda t: f"{tx_icon_map.get(t, '')} {t}")
+            
+            # UPGRADE: Interactive Selectable Dataframe remains fully intact!
             event = st.dataframe(
                 df_view, 
                 use_container_width=True, 
