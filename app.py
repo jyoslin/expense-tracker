@@ -309,7 +309,7 @@ if menu == "📊 Overview":
     
     st.divider()
 
-    st.subheader("💳 Current Balances")
+   st.subheader("💳 Current Balances")
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
         st.dataframe(
@@ -318,7 +318,12 @@ if menu == "📊 Overview":
             use_container_width=True,
             column_config={
                 "name": "Account Name",
-                "type": "Type",
+                "type": st.column_config.SelectboxColumn(
+                    "Type",
+                    options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"],
+                    # UPGRADE: Adding custom colors for each type
+                    required=True,
+                ),
                 "balance": st.column_config.NumberColumn("Balance", format="%.2f"),
                 "currency": "Currency"
             }
