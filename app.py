@@ -11,11 +11,14 @@ import re
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
 def check_password():
-    # 1. NEW: Check if the secret token is in the URL
-    # (If your Streamlit version is older, change st.query_params to st.experimental_get_query_params)
+    # 1. Check if the secret token is in the URL
     if st.query_params.get("token") == st.secrets["APP_PASSWORD"]:
-        return True
-
+        # Log the user in
+        st.session_state["password_correct"] = True
+        
+        # UPGRADE: Immediately erase the token from the URL!
+        st.query_params.clear()
+        
     # 2. Fallback: Standard password box if URL token is missing
     def password_entered():
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
@@ -24,9 +27,11 @@ def check_password():
         else:
             st.session_state["password_correct"] = False
 
+    # 3. If already logged in, show the app
     if st.session_state.get("password_correct", False):
         return True
 
+    # 4. Otherwise, show the password input
     st.text_input("🔒 Please enter your password", type="password", on_change=password_entered, key="password")
     if "password_correct" in st.session_state and not st.session_state["password_correct"]:
         st.error("😕 Password incorrect")
