@@ -11,6 +11,12 @@ import re
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
 def check_password():
+    # 1. NEW: Check if the secret token is in the URL
+    # (If your Streamlit version is older, change st.query_params to st.experimental_get_query_params)
+    if st.query_params.get("token") == st.secrets["APP_PASSWORD"]:
+        return True
+
+    # 2. Fallback: Standard password box if URL token is missing
     def password_entered():
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
@@ -28,7 +34,6 @@ def check_password():
 
 if not check_password():
     st.stop()
-
 # Connect to Supabase
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
