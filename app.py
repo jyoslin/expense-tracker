@@ -344,15 +344,14 @@ if menu == "📊 Overview":
     st.header("📊 Overview")
     
     if not df_active.empty:
-        df_calc = df_active.copy()
-        # Ensure all balances are converted to SGD
-        df_calc['sgd_value'] = df_calc['balance'] * df_calc['manual_exchange_rate']
+        # UPGRADE: Filter the dataframe to ONLY include SGD accounts
+        df_calc = df_active[df_active['currency'] == 'SGD'].copy()
         
-        # 1. Calculate individual category totals
-        bank_tot = df_calc[df_calc['type'] == 'Bank']['sgd_value'].sum()
-        cc_tot = df_calc[df_calc['type'] == 'Credit Card']['sgd_value'].sum()
-        custodial_tot = df_calc[df_calc['type'] == 'Custodial']['sgd_value'].sum()
-        sf_tot = df_calc[df_calc['type'] == 'Sinking Fund']['sgd_value'].sum()
+        # 1. Calculate individual category totals using the raw 'balance'
+        bank_tot = df_calc[df_calc['type'] == 'Bank']['balance'].sum()
+        cc_tot = df_calc[df_calc['type'] == 'Credit Card']['balance'].sum()
+        custodial_tot = df_calc[df_calc['type'] == 'Custodial']['balance'].sum()
+        sf_tot = df_calc[df_calc['type'] == 'Sinking Fund']['balance'].sum()
         
         # 2. Calculate combined metrics based on custom formulas
         net_worth = bank_tot - cc_tot - custodial_tot + sf_tot
@@ -365,7 +364,7 @@ if menu == "📊 Overview":
     # --- UI DISPLAY ---
     
     # Row 1: The Four Base Totals
-    st.subheader("🏦 Account Totals")
+    st.subheader("🏦 SGD Account Totals")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Bank Total", f"${bank_tot:,.2f}")
     c2.metric("Credit Card Total", f"${cc_tot:,.2f}")
@@ -375,7 +374,7 @@ if menu == "📊 Overview":
     st.divider()
     
     # Row 2: The Calculated Metrics & Formulas
-    st.subheader("📈 Wealth Metrics")
+    st.subheader("📈 Wealth Metrics (SGD Only)")
     m1, m2 = st.columns(2)
     
     # Dynamically build the formula strings to show the live math
@@ -383,15 +382,14 @@ if menu == "📊 Overview":
     la_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) - Sinking Fund (${sf_tot:,.2f})"
     
     with m1:
-        st.metric("Total Net Worth (SGD)", f"${net_worth:,.2f}")
+        st.metric("Total Net Worth", f"${net_worth:,.2f}")
         st.caption(f"**Calculation:** {nw_formula}")
         
     with m2:
-        st.metric("Liquid Assets (SGD)", f"${liquid:,.2f}")
+        st.metric("Liquid Assets", f"${liquid:,.2f}")
         st.caption(f"**Calculation:** {la_formula}")
     
     st.divider()
-
     st.subheader("💳 Current Balances")
     if not df_active.empty:
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
