@@ -279,21 +279,35 @@ expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Custodial', '
 
 # --- SIDEBAR NAVIGATION & ICON MAPPING ---
 st.sidebar.title("Navigation")
-menu = st.sidebar.radio("Go to:", ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings", "📈 Reports"])
+menu = st.sidebar.radio(
+    "Go to:", 
+    ["📊 Overview", "📝 Entry", "🎯 Goals", "📅 Schedule", "⚙️ Settings", "📈 Reports"], 
+    index=1
+)
 
 st.sidebar.divider()
-st.sidebar.subheader("🎨 Icon Mapping")
-st.sidebar.caption("Customize account & transaction icons:")
-icon_bank = st.sidebar.text_input("Bank", "🏦")
-icon_cc = st.sidebar.text_input("Credit Card", "💳")
-icon_cust = st.sidebar.text_input("Custodial", "🛡️")
-icon_sf = st.sidebar.text_input("Sinking Fund", "🎯")
-icon_loan = st.sidebar.text_input("Loan", "📉")
-icon_inv = st.sidebar.text_input("Investment", "📈")
 
-icon_inc = st.sidebar.text_input("Income", "🟢")
-icon_exp = st.sidebar.text_input("Expense", "🔴")
-icon_tx = st.sidebar.text_input("Transfer", "🔄")
+# 1. Put everything inside an expander so it is hidden by default
+with st.sidebar.expander("🎨 Icon Mapping", expanded=False):
+    st.caption("Customize account & transaction icons:")
+    
+    # 2. Use columns to put 3 icons per row
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        icon_bank = st.text_input("Bank", "🏦")
+        icon_sf = st.text_input("Sinking", "🎯")
+        icon_inc = st.text_input("Income", "🟢")
+        
+    with col2:
+        icon_cc = st.text_input("Card", "💳")
+        icon_loan = st.text_input("Loan", "📉")
+        icon_exp = st.text_input("Expense", "🔴")
+        
+    with col3:
+        icon_cust = st.text_input("Custodial", "🛡️")
+        icon_inv = st.text_input("Invest", "📈")
+        icon_tx = st.text_input("Transfer", "🔄")
 
 icon_map = {
     "Bank": icon_bank, "Credit Card": icon_cc, "Custodial": icon_cust,
