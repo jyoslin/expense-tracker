@@ -911,103 +911,109 @@ if menu == "📅 Schedule":
     st.header("📅 Schedule Manager")
     
     # 1. Fetch existing schedule rules
-    schedule_data = supabase.table("schedule").select("*").execute().data
+    response = supabase.table("schedule").select("*").execute()
+    schedule_data = response.data
     
-    # 2. Process Data for Editor
+    # 2. Initialize DataFrame with required columns to prevent KeyError if empty
     if schedule_data:
         df_sch = pd.DataFrame(schedule_data)
-        
-        # Helper Maps for Account ID <-> Name
-        id_to_name_map = dict(zip(df_active['id'], df_active['name']))
-        name_to_id_map = dict(zip(df_active['name'], df_active['id']))
-        
-        # Add a readable 'Account Name' column for the dropdown
+    else:
+        # Create an empty DataFrame with the expected schema
+        df_sch = pd.DataFrame(columns=[
+            "id", "created_at", "user_id", "account_id", 
+            "name", "amount", "type", "frequency", "day_of_month"
+        ])
+
+    # 3. Process Data for Editor
+    # Helper Maps for Account ID <-> Name
+    id_to_name_map = dict(zip(df_active['id'], df_active['name']))
+    name_to_id_map = dict(zip(df_active['name'], df_active['id']))
+    
+    # SAFELY create the 'account_name' column
+    if not df_sch.empty and 'account_id' in df_sch.columns:
         df_sch['account_name'] = df_sch['account_id'].map(id_to_name_map)
-        
-        st.subheader("📝 Edit Scheduled Items")
-        st.caption("Double-click any cell to edit. Change amounts, dates, or re-assign accounts directly.")
-        
-        # 3. Render the Editable Dataframe
-        edited_df = st.data_editor(
-            df_sch,
-            key="schedule_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic", # Allows adding/deleting rows
-            column_config={
-                "id": None,          # Hide internal IDs
-                "created_at": None,
-                "user_id": None,
-                "account_id": None,  # Hide raw ID, show Name instead
-                "name": "Description",
-                "amount": st.column_config.NumberColumn("Amount", format="%.2f"),
-                "type": st.column_config.SelectboxColumn(
-                    "Type", 
-                    options=["Income", "Expense", "Transfer", "Virtual Expense", "Virtual Funding"],
-                    width="medium"
-                ),
-                "frequency": st.column_config.SelectboxColumn(
-                    "Frequency", 
-                    options=["Monthly", "Yearly", "One-Time"],
-                    width="small"
-                ),
-                "day_of_month": st.column_config.NumberColumn(
-                    "Day", 
-                    help="Day of month (1-31)",
-                    min_value=1, 
-                    max_value=31,
-                    format="%d"
-                ),
-                "account_name": st.column_config.SelectboxColumn(
-                    "Account", 
-                    help="Account to charge/fund",
-                    width="medium",
-                    options=account_list,
-                    required=True
-                )
-            }
-        )
-        
-        # 4. Save Button Logic
-        if st.button("💾 Save Changes", type="primary"):
-            try:
-                # Loop through the edited dataframe to sync with DB
-                # Note: This is a simplified 'upsert' logic. 
-                # For a robust app, you might compare 'edited_df' vs 'df_sch' to find diffs.
+    else:
+        # If empty or missing column, just add empty string column so editor doesn't crash
+        df_sch['account_name'] = ""
+
+    st.subheader("📝 Edit Scheduled Items")
+    st.caption("Double-click any cell to edit. Change amounts, dates, or re-assign accounts directly.")
+    
+    # 4. Render the Editable Dataframe
+    edited_df = st.data_editor(
+        df_sch,
+        key="schedule_editor",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic", # Allows adding/deleting rows
+        column_config={
+            "id": None,          # Hide internal IDs
+            "created_at": None,
+            "user_id": None,
+            "account_id": None,  # Hide raw ID, show Name instead
+            "name": "Description",
+            "amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+            "type": st.column_config.SelectboxColumn(
+                "Type", 
+                options=["Income", "Expense", "Transfer", "Virtual Expense", "Virtual Funding"],
+                width="medium"
+            ),
+            "frequency": st.column_config.SelectboxColumn(
+                "Frequency", 
+                options=["Monthly", "Yearly", "One-Time"],
+                width="small"
+            ),
+            "day_of_month": st.column_config.NumberColumn(
+                "Day", 
+                help="Day of month (1-31)",
+                min_value=1, 
+                max_value=31,
+                format="%d"
+            ),
+            "account_name": st.column_config.SelectboxColumn(
+                "Account", 
+                help="Account to charge/fund",
+                width="medium",
+                options=account_list,
+                required=True
+            )
+        }
+    )
+    
+    # 5. Save Button Logic
+    if st.button("💾 Save Changes", type="primary"):
+        try:
+            records_to_upsert = []
+            
+            for index, row in edited_df.iterrows():
+                # Resolve Account Name back to ID
+                acc_id = name_to_id_map.get(row['account_name'])
                 
-                records_to_upsert = []
+                # Basic Validation
+                if not row['name']: continue # Skip empty rows
                 
-                for index, row in edited_df.iterrows():
-                    # Resolve Account Name back to ID
-                    # If user picked a valid name, get ID. If not found (e.g. cleared), keep old or error.
-                    acc_id = name_to_id_map.get(row['account_name'])
-                    
-                    if not acc_id:
-                        st.error(f"Error: Row '{row['name']}' has an invalid Account Name.")
-                        st.stop()
+                record = {
+                    "name": row['name'],
+                    "amount": float(row['amount'] or 0),
+                    "type": row['type'],
+                    "frequency": row['frequency'],
+                    "day_of_month": int(row['day_of_month'] or 1),
+                    "account_id": acc_id
+                }
+                
+                # If it's an existing row (has ID), include it to update
+                if pd.notna(row.get("id")) and str(row["id"]).strip() != "":
+                        record["id"] = row["id"]
                         
-                    record = {
-                        "name": row['name'],
-                        "amount": row['amount'],
-                        "type": row['type'],
-                        "frequency": row['frequency'],
-                        "day_of_month": int(row['day_of_month']),
-                        "account_id": acc_id
-                        # We don't send 'id' for new rows so Supabase generates it
-                    }
-                    
-                    # If it's an existing row (has ID), include it to update
-                    if pd.notna(row.get("id")):
-                         record["id"] = row["id"]
-                         
-                    records_to_upsert.append(record)
-                
-                # Perform Upsert (Updates existing IDs, Inserts new ones)
-                if records_to_upsert:
-                    supabase.table("schedule").upsert(records_to_upsert).execute()
-                
-                # Handle Deletions (Rows present in original but missing in edited)
-                # (Streamlit data_editor handles additions/edits well, but deletions require manual logic check)
+                records_to_upsert.append(record)
+            
+            # Perform Upsert (Updates existing IDs, Inserts new ones)
+            if records_to_upsert:
+                supabase.table("schedule").upsert(records_to_upsert).execute()
+            
+            # Handle Deletions 
+            # (If original df had IDs that are NOT in the submitted records, delete them)
+            if not df_sch.empty and 'id' in df_sch.columns:
                 original_ids = set(df_sch['id'].dropna().astype(str))
                 current_ids = set([str(r['id']) for r in records_to_upsert if 'id' in r])
                 deleted_ids = original_ids - current_ids
@@ -1015,48 +1021,35 @@ if menu == "📅 Schedule":
                 if deleted_ids:
                     supabase.table("schedule").delete().in_("id", list(deleted_ids)).execute()
 
-                st.success("✅ Schedule updated successfully!")
-                st.rerun()
+            st.success("✅ Schedule updated successfully!")
+            st.rerun()
 
-            except Exception as e:
-                st.error(f"❌ Error saving schedule: {str(e)}")
-    
-    else:
-        st.info("No scheduled items found. Add one in the editor above (if enabled) or via database.")
+        except Exception as e:
+            st.error(f"❌ Error saving schedule: {str(e)}")
 
     st.divider()
 
-    # 5. Upcoming Projections Logic (Maintained from your original view)
+    # 6. Upcoming Projections Logic
     st.subheader("🔮 Upcoming Projections (Next 3 Months)")
     
     if schedule_data:
         upcoming_items = []
         today = date.today()
         
-        # Loop through rules to project dates
         for rule in schedule_data:
-            # Basic projection logic (simplified for brevity, matches your typical needs)
-            # You can copy-paste your exact complex projection logic here if it differs
-            dom = rule['day_of_month']
+            dom = rule.get('day_of_month', 1)
             
-            # Project for next 3 months
             for i in range(3):
-                # Calculate target month/year
                 target_date = today + relativedelta(months=i)
-                
-                # Handle short months (e.g. Feb 30 -> Feb 28)
                 try:
                     proj_date = date(target_date.year, target_date.month, dom)
                 except ValueError:
-                    # Fallback to last day of month
+                    # Handle Feb 30 -> Feb 28 logic
                     last_day = (date(target_date.year, target_date.month, 1) + relativedelta(months=1) - timedelta(days=1)).day
                     proj_date = date(target_date.year, target_date.month, last_day)
                 
-                # Only show future items
                 if proj_date >= today:
-                    # Get Account Name
-                    acc_name = id_to_name_map.get(rule['account_id'], "Unknown")
-                    
+                    acc_name = id_to_name_map.get(rule.get('account_id'), "Unknown")
                     upcoming_items.append({
                         "Date": proj_date,
                         "Description": rule['name'],
@@ -1065,12 +1058,10 @@ if menu == "📅 Schedule":
                         "Account": acc_name
                     })
         
-        # Sort and Display
         if upcoming_items:
             df_upcoming = pd.DataFrame(upcoming_items)
             df_upcoming = df_upcoming.sort_values(by="Date")
             
-            # Format for display
             st.dataframe(
                 df_upcoming,
                 hide_index=True,
@@ -1082,6 +1073,8 @@ if menu == "📅 Schedule":
             )
         else:
             st.info("No upcoming items in the next 3 months.")
+    else:
+        st.info("No scheduled items found. Add one in the editor above.")
 
 
 # --- MENU: SETTINGS ---
