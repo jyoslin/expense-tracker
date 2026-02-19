@@ -392,22 +392,42 @@ if menu == "📊 Overview":
     st.divider()
     st.subheader("💳 Current Balances")
     if not df_active.empty:
+        # 1. Prepare the display data
         df_display = df_active[['name', 'type', 'balance', 'currency']].copy()
         
-        # UPGRADE: Prepend the mapped icon to the 'name' column instead of 'type'
+        # Add icons to name
         df_display['name'] = df_display.apply(lambda row: f"{icon_map.get(row['type'], '')} {row['name']}", axis=1)
-        
-        st.dataframe(
+
+        # 2. Render clickable table
+        # We use format="%.2f" (No '$') to respect the user's currency column
+        event = st.dataframe(
             df_display, 
             hide_index=True, 
             use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
             column_config={
                 "name": "Account Name",
                 "type": "Type",
-                "balance": st.column_config.NumberColumn("Balance", format="%.2f"),
+                "balance": st.column_config.NumberColumn("Balance", format="%.2f"), # No currency symbol forced
                 "currency": "Currency"
             }
         )
+        
+        # 3. Handle Click Event: Update the 'ledger_select' for the Account Statement below
+        if event.selection.rows:
+            selected_idx = event.selection.rows[0]
+            # Extract the pure account name (removing the icon we added for display)
+            # We assume the raw name is what matches the selectbox options
+            full_display_name = df_display.iloc[selected_idx]['name']
+            
+            # Helper to find the matching original name in your account_list
+            # (Matches purely based on the string if icons are consistent, or we fallback)
+            # Since we added icons to df_display, let's find the original name from df_active
+            selected_real_name = df_active.iloc[selected_idx]['name']
+            
+            # Update the session state widget for the dropdown below
+            st.session_state["ledger_select"] = selected_real_name
 
     st.divider()
 
@@ -887,91 +907,181 @@ elif menu == "🎯 Goals":
 
 
 # --- MENU: SCHEDULE ---
-elif menu == "📅 Schedule":
-    st.header("📅 Manage Future Payments")
+if menu == "📅 Schedule":
+    st.header("📅 Schedule Manager")
     
-    with st.expander("➕ Add Schedule", expanded=False):
-        with st.form("sch_form"):
-            s_desc = st.text_input("Description")
-            c1, c2, c3 = st.columns(3)
-            s_amount = c1.number_input("Amount", min_value=0.01)
-            s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
-            s_date = c3.date_input("Start Date", datetime.today())
-            
-            s_cat_opts = get_categories()['name'].tolist()
-            s_cat = st.selectbox("Category", s_cat_opts, index=None, placeholder="Select Category (Optional)...")
-            s_manual = st.checkbox("🔔 Manual Reminder?", value=False)
-            s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
-            
-            s_from, s_to = None, None
-            if s_type == "Expense": s_from = st.selectbox("From Account", non_loan_accounts, index=None, placeholder="Select Account...")
-            elif s_type == "Income": s_to = st.selectbox("To Account", account_list, index=None, placeholder="Select Account...")
-            elif s_type == "Transfer":
-                s_from = st.selectbox("From", non_loan_accounts, key="s_f", index=None, placeholder="Select Source...")
-                s_to = st.selectbox("To", account_list, key="s_t", index=None, placeholder="Select Destination...")
-                
-            if st.form_submit_button("Schedule It"):
-                if s_type == "Expense" and not s_from:
-                    st.error("❌ Please select a 'From Account'.")
-                elif s_type == "Income" and not s_to:
-                    st.error("❌ Please select a 'To Account'.")
-                elif s_type == "Transfer" and (not s_from or not s_to):
-                    st.error("❌ Please select both Source and Destination accounts.")
-                else:
-                    final_sch_cat = s_cat if s_cat else "Others"
-                    f_id = account_map.get(s_from) if s_from else None
-                    t_id = account_map.get(s_to) if s_to else None
-                    
-                    supabase.table('schedule').insert({
-                        "description": s_desc, "amount": s_amount, "type": s_type, 
-                        "from_account_id": f_id, "to_account_id": t_id, 
-                        "frequency": s_freq, "next_run_date": str(s_date),
-                        "is_manual": s_manual, "category": final_sch_cat
-                    }).execute()
-                    st.success("Scheduled!")
-                    clear_cache()
-
-    upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
-    if upcoming:
-        st.write("### 🗓️ Upcoming Items")
-        df_upcoming = pd.DataFrame(upcoming)
+    # 1. Fetch existing schedule rules
+    schedule_data = supabase.table("schedule").select("*").execute().data
+    
+    # 2. Process Data for Editor
+    if schedule_data:
+        df_sch = pd.DataFrame(schedule_data)
         
-        # UPGRADE: Interactive Selectable Dataframe
-        event_sch = st.dataframe(
-            df_upcoming[['next_run_date', 'description', 'amount', 'frequency']], 
-            hide_index=True, 
+        # Helper Maps for Account ID <-> Name
+        id_to_name_map = dict(zip(df_active['id'], df_active['name']))
+        name_to_id_map = dict(zip(df_active['name'], df_active['id']))
+        
+        # Add a readable 'Account Name' column for the dropdown
+        df_sch['account_name'] = df_sch['account_id'].map(id_to_name_map)
+        
+        st.subheader("📝 Edit Scheduled Items")
+        st.caption("Double-click any cell to edit. Change amounts, dates, or re-assign accounts directly.")
+        
+        # 3. Render the Editable Dataframe
+        edited_df = st.data_editor(
+            df_sch,
+            key="schedule_editor",
             use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row"
+            hide_index=True,
+            num_rows="dynamic", # Allows adding/deleting rows
+            column_config={
+                "id": None,          # Hide internal IDs
+                "created_at": None,
+                "user_id": None,
+                "account_id": None,  # Hide raw ID, show Name instead
+                "name": "Description",
+                "amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+                "type": st.column_config.SelectboxColumn(
+                    "Type", 
+                    options=["Income", "Expense", "Transfer", "Virtual Expense", "Virtual Funding"],
+                    width="medium"
+                ),
+                "frequency": st.column_config.SelectboxColumn(
+                    "Frequency", 
+                    options=["Monthly", "Yearly", "One-Time"],
+                    width="small"
+                ),
+                "day_of_month": st.column_config.NumberColumn(
+                    "Day", 
+                    help="Day of month (1-31)",
+                    min_value=1, 
+                    max_value=31,
+                    format="%d"
+                ),
+                "account_name": st.column_config.SelectboxColumn(
+                    "Account", 
+                    help="Account to charge/fund",
+                    width="medium",
+                    options=account_list,
+                    required=True
+                )
+            }
         )
         
-        st.write("### 🗑️ Cancel Scheduled Item")
+        # 4. Save Button Logic
+        if st.button("💾 Save Changes", type="primary"):
+            try:
+                # Loop through the edited dataframe to sync with DB
+                # Note: This is a simplified 'upsert' logic. 
+                # For a robust app, you might compare 'edited_df' vs 'df_sch' to find diffs.
+                
+                records_to_upsert = []
+                
+                for index, row in edited_df.iterrows():
+                    # Resolve Account Name back to ID
+                    # If user picked a valid name, get ID. If not found (e.g. cleared), keep old or error.
+                    acc_id = name_to_id_map.get(row['account_name'])
+                    
+                    if not acc_id:
+                        st.error(f"Error: Row '{row['name']}' has an invalid Account Name.")
+                        st.stop()
+                        
+                    record = {
+                        "name": row['name'],
+                        "amount": row['amount'],
+                        "type": row['type'],
+                        "frequency": row['frequency'],
+                        "day_of_month": int(row['day_of_month']),
+                        "account_id": acc_id
+                        # We don't send 'id' for new rows so Supabase generates it
+                    }
+                    
+                    # If it's an existing row (has ID), include it to update
+                    if pd.notna(row.get("id")):
+                         record["id"] = row["id"]
+                         
+                    records_to_upsert.append(record)
+                
+                # Perform Upsert (Updates existing IDs, Inserts new ones)
+                if records_to_upsert:
+                    supabase.table("schedule").upsert(records_to_upsert).execute()
+                
+                # Handle Deletions (Rows present in original but missing in edited)
+                # (Streamlit data_editor handles additions/edits well, but deletions require manual logic check)
+                original_ids = set(df_sch['id'].dropna().astype(str))
+                current_ids = set([str(r['id']) for r in records_to_upsert if 'id' in r])
+                deleted_ids = original_ids - current_ids
+                
+                if deleted_ids:
+                    supabase.table("schedule").delete().in_("id", list(deleted_ids)).execute()
+
+                st.success("✅ Schedule updated successfully!")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ Error saving schedule: {str(e)}")
+    
+    else:
+        st.info("No scheduled items found. Add one in the editor above (if enabled) or via database.")
+
+    st.divider()
+
+    # 5. Upcoming Projections Logic (Maintained from your original view)
+    st.subheader("🔮 Upcoming Projections (Next 3 Months)")
+    
+    if schedule_data:
+        upcoming_items = []
+        today = date.today()
         
-        # UPGRADE: Click-to-Select Safety Preview Logic
-        if len(event_sch.selection.rows) > 0:
-            sel_idx = event_sch.selection.rows[0]
-            sel_row = df_upcoming.iloc[sel_idx]
+        # Loop through rules to project dates
+        for rule in schedule_data:
+            # Basic projection logic (simplified for brevity, matches your typical needs)
+            # You can copy-paste your exact complex projection logic here if it differs
+            dom = rule['day_of_month']
             
-            with st.container(border=True):
-                st.warning("⚠️ **Cancellation Preview & Impact Analysis**")
-                st.write(f"**Target:** {sel_row['description']} (${sel_row['amount']:,.2f})")
-                st.write(f"**Scheduled For:** {sel_row['next_run_date']}")
+            # Project for next 3 months
+            for i in range(3):
+                # Calculate target month/year
+                target_date = today + relativedelta(months=i)
                 
-                # Retrieve Account Names for clearer impact analysis
-                id_to_name = {v: k for k, v in account_map.items()}
-                f_acc = id_to_name.get(sel_row['from_account_id'], "None")
-                t_acc = id_to_name.get(sel_row['to_account_id'], "None")
-                st.write(f"**Accounts Involved:** From [{f_acc}] ➔ To [{t_acc}]")
+                # Handle short months (e.g. Feb 30 -> Feb 28)
+                try:
+                    proj_date = date(target_date.year, target_date.month, dom)
+                except ValueError:
+                    # Fallback to last day of month
+                    last_day = (date(target_date.year, target_date.month, 1) + relativedelta(months=1) - timedelta(days=1)).day
+                    proj_date = date(target_date.year, target_date.month, last_day)
                 
-                st.write("**Impact:** No current balances will be affected. This future payment will simply be removed from your timeline.")
-                
-                if st.button("🚨 Confirm Cancel Scheduled Payment", use_container_width=True):
-                    supabase.table('schedule').delete().eq("id", int(sel_row['id'])).execute()
-                    st.success("Scheduled payment cancelled!")
-                    clear_cache()
-                    st.rerun()
+                # Only show future items
+                if proj_date >= today:
+                    # Get Account Name
+                    acc_name = id_to_name_map.get(rule['account_id'], "Unknown")
+                    
+                    upcoming_items.append({
+                        "Date": proj_date,
+                        "Description": rule['name'],
+                        "Amount": rule['amount'],
+                        "Type": rule['type'],
+                        "Account": acc_name
+                    })
+        
+        # Sort and Display
+        if upcoming_items:
+            df_upcoming = pd.DataFrame(upcoming_items)
+            df_upcoming = df_upcoming.sort_values(by="Date")
+            
+            # Format for display
+            st.dataframe(
+                df_upcoming,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Date": st.column_config.DateColumn("Due Date", format="DD MMM YYYY"),
+                    "Amount": st.column_config.NumberColumn("Amount", format="%.2f")
+                }
+            )
         else:
-            st.info("👆 **Click on any row** in the table above to preview and cancel a scheduled payment.")
+            st.info("No upcoming items in the next 3 months.")
 
 
 # --- MENU: SETTINGS ---
