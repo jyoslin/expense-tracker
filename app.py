@@ -358,8 +358,8 @@ type_map = dict(zip(df_active['name'], df_active['type'])) # NEW: Map names to t
 account_list = df_active['name'].tolist() if not df_active.empty else []
 
 non_loan_accounts = df_active[df_active['type'] != 'Loan']['name'].tolist() if not df_active.empty else []
-expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Custodial', 'Sinking Fund'])]['name'].tolist() if not df_active.empty else []
-
+# NEW LINE (Allows Custodial)
+expense_src_accounts = df_active[~df_active['type'].isin(['Loan', 'Sinking Fund'])]['name'].tolist() if not df_active.empty else []
 # --- SIDEBAR NAVIGATION & ICON MAPPING ---
 st.sidebar.title("Navigation")
 menu = st.sidebar.radio(
