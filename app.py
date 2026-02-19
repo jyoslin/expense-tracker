@@ -908,92 +908,87 @@ elif menu == "🎯 Goals":
 
 # --- MENU: SCHEDULE ---
 elif menu == "📅 Schedule":
-    st.header("📅 Manage Future Payments")
+    st.header("📅 Payment Schedule")
     
-    with st.expander("➕ Add Schedule", expanded=False):
-        with st.form("sch_form"):
-            s_desc = st.text_input("Description")
-            c1, c2, c3 = st.columns(3)
-            s_amount = c1.number_input("Amount", min_value=0.01)
-            s_freq = c2.selectbox("Frequency", ["Monthly", "One-Time"])
-            s_date = c3.date_input("Start Date", datetime.today())
-            
-            s_cat_opts = get_categories()['name'].tolist()
-            s_cat = st.selectbox("Category", s_cat_opts, index=None, placeholder="Select Category (Optional)...")
-            s_manual = st.checkbox("🔔 Manual Reminder?", value=False)
-            s_type = st.selectbox("Type", ["Expense", "Transfer", "Income"])
-            
-            s_from, s_to = None, None
-            if s_type == "Expense": s_from = st.selectbox("From Account", non_loan_accounts, index=None, placeholder="Select Account...")
-            elif s_type == "Income": s_to = st.selectbox("To Account", account_list, index=None, placeholder="Select Account...")
-            elif s_type == "Transfer":
-                s_from = st.selectbox("From", non_loan_accounts, key="s_f", index=None, placeholder="Select Source...")
-                s_to = st.selectbox("To", account_list, key="s_t", index=None, placeholder="Select Destination...")
-                
-            if st.form_submit_button("Schedule It"):
-                if s_type == "Expense" and not s_from:
-                    st.error("❌ Please select a 'From Account'.")
-                elif s_type == "Income" and not s_to:
-                    st.error("❌ Please select a 'To Account'.")
-                elif s_type == "Transfer" and (not s_from or not s_to):
-                    st.error("❌ Please select both Source and Destination accounts.")
-                else:
-                    final_sch_cat = s_cat if s_cat else "Others"
-                    f_id = account_map.get(s_from) if s_from else None
-                    t_id = account_map.get(s_to) if s_to else None
-                    
-                    supabase.table('schedule').insert({
-                        "description": s_desc, "amount": s_amount, "type": s_type, 
-                        "from_account_id": f_id, "to_account_id": t_id, 
-                        "frequency": s_freq, "next_run_date": str(s_date),
-                        "is_manual": s_manual, "category": final_sch_cat
-                    }).execute()
-                    st.success("Scheduled!")
-                    clear_cache()
-
-    upcoming = supabase.table('schedule').select("*").order('next_run_date').execute().data
-    if upcoming:
-        st.write("### 🗓️ Upcoming Items")
-        df_upcoming = pd.DataFrame(upcoming)
+    # 1. Fetch data from Supabase
+    sched_data = supabase.table('schedule').select("*").order('next_run_date').execute().data
+    
+    if not sched_data:
+        st.info("No scheduled items found.")
+    else:
+        # Create a mapping for account display
+        id_to_name = {v: k for k, v in account_map.items()}
         
-        # UPGRADE: Interactive Selectable Dataframe
-        event_sch = st.dataframe(
-            df_upcoming[['next_run_date', 'description', 'amount', 'frequency']], 
-            hide_index=True, 
+        # Prepare data for display
+        df_sched = pd.DataFrame(sched_data)
+        display_df = df_sched.copy()
+        
+        # Format the account columns for the view
+        display_df['From'] = display_df['from_account_id'].map(id_to_name)
+        display_df['To'] = display_df['to_account_id'].map(id_to_name)
+        
+        st.subheader("Upcoming Items")
+        st.caption("👆 Click on a row below to edit the details of that scheduled item.")
+        
+        # Render interactive dataframe
+        event = st.dataframe(
+            display_df[['description', 'amount', 'frequency', 'next_run_date', 'From', 'To']],
+            hide_index=True,
             use_container_width=True,
             on_select="rerun",
             selection_mode="single-row"
         )
-        
-        st.write("### 🗑️ Cancel Scheduled Item")
-        
-        # UPGRADE: Click-to-Select Safety Preview Logic
-        if len(event_sch.selection.rows) > 0:
-            sel_idx = event_sch.selection.rows[0]
-            sel_row = df_upcoming.iloc[sel_idx]
+
+        # --- NEW: EDIT BLOCK ---
+        if event.selection.rows:
+            selected_idx = event.selection.rows[0]
+            selected_row = df_sched.iloc[selected_idx]
+            sched_id = selected_row['id']
             
-            with st.container(border=True):
-                st.warning("⚠️ **Cancellation Preview & Impact Analysis**")
-                st.write(f"**Target:** {sel_row['description']} (${sel_row['amount']:,.2f})")
-                st.write(f"**Scheduled For:** {sel_row['next_run_date']}")
+            st.divider()
+            st.subheader(f"✏️ Edit Item: {selected_row['description']}")
+            
+            with st.form("edit_schedule_form"):
+                col1, col2 = st.columns(2)
                 
-                # Retrieve Account Names for clearer impact analysis
-                id_to_name = {v: k for k, v in account_map.items()}
-                f_acc = id_to_name.get(sel_row['from_account_id'], "None")
-                t_acc = id_to_name.get(sel_row['to_account_id'], "None")
-                st.write(f"**Accounts Involved:** From [{f_acc}] ➔ To [{t_acc}]")
+                # Basic Info
+                new_desc = col1.text_input("Description", value=selected_row['description'])
+                new_amount = col2.number_input("Amount", value=float(selected_row['amount']), step=0.01)
                 
-                st.write("**Impact:** No current balances will be affected. This future payment will simply be removed from your timeline.")
+                # Frequency and Date
+                freq_options = ["One-Time", "Daily", "Weekly", "Monthly", "Yearly"]
+                current_freq = selected_row['frequency']
+                new_freq = col1.selectbox("Frequency", freq_options, 
+                                        index=freq_options.index(current_freq) if current_freq in freq_options else 0)
                 
-                if st.button("🚨 Confirm Cancel Scheduled Payment", use_container_width=True):
-                    supabase.table('schedule').delete().eq("id", int(sel_row['id'])).execute()
-                    st.success("Scheduled payment cancelled!")
+                new_date = col2.date_input("Next Run Date", value=pd.to_datetime(selected_row['next_run_date']).date())
+                
+                # Account Selection (From and To)
+                current_from = id_to_name.get(selected_row['from_account_id'])
+                current_to = id_to_name.get(selected_row['to_account_id'])
+                
+                new_from_acc = col1.selectbox("From Account", account_list, 
+                                            index=account_list.index(current_from) if current_from in account_list else None,
+                                            format_func=format_acc)
+                
+                new_to_acc = col2.selectbox("To Account", account_list, 
+                                          index=account_list.index(current_to) if current_to in account_list else None,
+                                          format_func=format_acc)
+                
+                if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                    update_data = {
+                        "description": new_desc,
+                        "amount": new_amount,
+                        "frequency": new_freq,
+                        "next_run_date": str(new_date),
+                        "from_account_id": account_map.get(new_from_acc),
+                        "to_account_id": account_map.get(new_to_acc)
+                    }
+                    
+                    supabase.table('schedule').update(update_data).eq('id', sched_id).execute()
+                    st.success("Item updated successfully!")
                     clear_cache()
                     st.rerun()
-        else:
-            st.info("👆 **Click on any row** in the table above to preview and cancel a scheduled payment.")
-
-
 
 # --- MENU: SETTINGS ---
 elif menu == "⚙️ Settings":
