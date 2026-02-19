@@ -6,23 +6,42 @@ import numpy as np
 from datetime import datetime, date, timedelta
 from dateutil.relativedelta import relativedelta
 import re
+import extra_streamlit_components as stx
 
 # --- 1. SECURITY & SETUP ---
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
+# Initialize the Cookie Manager
+@st.cache_resource
+def get_cookie_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_cookie_manager()
+
 def check_password():
+    # 0. Check if this device is already remembered in cookies!
+    if cookie_manager.get(cookie="remember_device") == "true":
+        st.session_state["password_correct"] = True
+        return True
+
     # 1. Check if the secret token is in the URL
     if st.query_params.get("token") == st.secrets["APP_PASSWORD"]:
-        # Log the user in
         st.session_state["password_correct"] = True
         
-        # UPGRADE: Immediately erase the token from the URL!
+        # Save a cookie to remember this device for 1 year (31,536,000 seconds)
+        cookie_manager.set("remember_device", "true", max_age=31536000)
+        
+        # Immediately erase the token from the URL!
         st.query_params.clear()
         
     # 2. Fallback: Standard password box if URL token is missing
     def password_entered():
         if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
+            
+            # Save a cookie to remember this device for 1 year
+            cookie_manager.set("remember_device", "true", max_age=31536000)
+            
             del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
