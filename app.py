@@ -391,10 +391,12 @@ with st.sidebar.expander("🎨 Icon Mapping", expanded=False):
         icon_cust = st.text_input("Custodial", "🛡️")
         icon_inv = st.text_input("Invest", "📈")
         icon_tx = st.text_input("Transfer", "🔄")
+        icon_rec = st.text_input("Receivable", "🤝")
 
 icon_map = {
     "Bank": icon_bank, "Credit Card": icon_cc, "Custodial": icon_cust,
-    "Sinking Fund": icon_sf, "Loan": icon_loan, "Investment": icon_inv
+    "Sinking Fund": icon_sf, "Loan": icon_loan, "Investment": icon_inv,
+    "Receivable": icon_rec
 }
 
 tx_icon_map = {
@@ -425,24 +427,29 @@ if menu == "📊 Overview":
         cc_tot = df_calc[df_calc['type'] == 'Credit Card']['balance'].sum()
         custodial_tot = df_calc[df_calc['type'] == 'Custodial']['balance'].sum()
         sf_tot = df_calc[df_calc['type'] == 'Sinking Fund']['balance'].sum()
+        rec_tot = df_calc[df_calc['type'] == 'Receivable']['balance'].sum()  # <--- NEW: Receivable Total
         
         # 2. Calculate combined metrics based on custom formulas
-        net_worth = bank_tot - cc_tot - custodial_tot + sf_tot
+        # Receivable is an Asset, so we ADD it to Net Worth. 
+        net_worth = bank_tot - cc_tot - custodial_tot + sf_tot + rec_tot
+        
+        # Receivable is NOT liquid (you can't spend it today), so it is excluded from Liquid.
         liquid = bank_tot - cc_tot - custodial_tot - sf_tot
         
     else:
-        bank_tot = cc_tot = custodial_tot = sf_tot = 0
+        bank_tot = cc_tot = custodial_tot = sf_tot = rec_tot = 0
         net_worth = liquid = 0
     
     # --- UI DISPLAY ---
     
-    # Row 1: The Four Base Totals
+    # Row 1: The Base Totals (Now 5 columns instead of 4)
     st.subheader("🏦 SGD Account Totals")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Bank Total", f"${bank_tot:,.2f}")
-    c2.metric("Credit Card Total", f"${cc_tot:,.2f}")
-    c3.metric("Custodial Total", f"${custodial_tot:,.2f}")
-    c4.metric("Sinking Fund Total", f"${sf_tot:,.2f}")
+    c2.metric("Credit Card", f"${cc_tot:,.2f}")
+    c3.metric("Custodial", f"${custodial_tot:,.2f}")
+    c4.metric("Sinking Fund", f"${sf_tot:,.2f}")
+    c5.metric("Receivable", f"${rec_tot:,.2f}")  # <--- NEW: Display Receivable Metric
     
     st.divider()
     
@@ -451,7 +458,7 @@ if menu == "📊 Overview":
     m1, m2 = st.columns(2)
     
     # Dynamically build the formula strings to show the live math
-    nw_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) + Sinking Fund (${sf_tot:,.2f})"
+    nw_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) + Sinking Fund (${sf_tot:,.2f}) + Receivable (${rec_tot:,.2f})"
     la_formula = f"Bank (${bank_tot:,.2f}) - CC (${cc_tot:,.2f}) - Custodial (${custodial_tot:,.2f}) - Sinking Fund (${sf_tot:,.2f})"
     
     with m1:
@@ -1098,7 +1105,7 @@ elif menu == "⚙️ Settings":
             num_rows="dynamic",
             hide_index=True, 
             column_config={
-                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Fund"]), 
+                "type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Fund", "Receivable"]), 
                 "budget_limit": st.column_config.NumberColumn("Budget Limit", format="$%.2f", step=0.01) 
             }
         )
