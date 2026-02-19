@@ -910,27 +910,59 @@ elif menu == "🎯 Goals":
 elif menu == "📅 Schedule":
     st.header("📅 Payment Schedule")
     
-    # 1. Fetch data from Supabase
+    # --- 1. ADD NEW SCHEDULED ITEM ---
+    with st.expander("➕ Add New Scheduled Item", expanded=False):
+        with st.form("new_schedule_form"):
+            c1, c2 = st.columns(2)
+            new_desc = c1.text_input("Description")
+            new_amount = c2.number_input("Amount", min_value=0.01, step=0.01)
+            
+            new_freq = c1.selectbox("Frequency", ["One-Time", "Daily", "Weekly", "Monthly", "Yearly"])
+            new_date = c2.date_input("Start/Next Run Date", value=date.today())
+            
+            new_from_acc = c1.selectbox("From Account", account_list, index=None, format_func=format_acc)
+            new_to_acc = c2.selectbox("To Account", account_list, index=None, format_func=format_acc)
+            
+            new_cat_df = get_categories()
+            new_cat = st.selectbox("Category", new_cat_df['name'].tolist() if not new_cat_df.empty else [])
+
+            if st.form_submit_button("🚀 Create Schedule", use_container_width=True):
+                if not new_desc or not new_from_acc:
+                    st.error("Please provide a description and source account.")
+                else:
+                    supabase.table('schedule').insert({
+                        "description": new_desc,
+                        "amount": new_amount,
+                        "frequency": new_freq,
+                        "next_run_date": str(new_date),
+                        "from_account_id": account_map.get(new_from_acc),
+                        "to_account_id": account_map.get(new_to_acc),
+                        "category": new_cat,
+                        "is_manual": True
+                    }).execute()
+                    st.success("New schedule added!")
+                    clear_cache()
+                    st.rerun()
+
+    st.divider()
+
+    # --- 2. VIEW & SELECT SCHEDULED ITEMS ---
     sched_data = supabase.table('schedule').select("*").order('next_run_date').execute().data
     
     if not sched_data:
         st.info("No scheduled items found.")
     else:
-        # Create a mapping for account display
         id_to_name = {v: k for k, v in account_map.items()}
-        
-        # Prepare data for display
         df_sched = pd.DataFrame(sched_data)
-        display_df = df_sched.copy()
         
-        # Format the account columns for the view
+        # Prepare display copy
+        display_df = df_sched.copy()
         display_df['From'] = display_df['from_account_id'].map(id_to_name)
         display_df['To'] = display_df['to_account_id'].map(id_to_name)
         
         st.subheader("Upcoming Items")
-        st.caption("👆 Click on a row below to edit the details of that scheduled item.")
+        st.caption("👆 Click a row to Edit or Delete.")
         
-        # Render interactive dataframe
         event = st.dataframe(
             display_df[['description', 'amount', 'frequency', 'next_run_date', 'From', 'To']],
             hide_index=True,
@@ -939,54 +971,43 @@ elif menu == "📅 Schedule":
             selection_mode="single-row"
         )
 
-        # --- NEW: EDIT BLOCK ---
+        # --- 3. EDIT & DELETE LOGIC ---
         if event.selection.rows:
             selected_idx = event.selection.rows[0]
             selected_row = df_sched.iloc[selected_idx]
             sched_id = selected_row['id']
             
             st.divider()
-            st.subheader(f"✏️ Edit Item: {selected_row['description']}")
+            col_edit, col_del = st.columns([3, 1])
             
-            with st.form("edit_schedule_form"):
-                col1, col2 = st.columns(2)
-                
-                # Basic Info
-                new_desc = col1.text_input("Description", value=selected_row['description'])
-                new_amount = col2.number_input("Amount", value=float(selected_row['amount']), step=0.01)
-                
-                # Frequency and Date
-                freq_options = ["One-Time", "Daily", "Weekly", "Monthly", "Yearly"]
-                current_freq = selected_row['frequency']
-                new_freq = col1.selectbox("Frequency", freq_options, 
-                                        index=freq_options.index(current_freq) if current_freq in freq_options else 0)
-                
-                new_date = col2.date_input("Next Run Date", value=pd.to_datetime(selected_row['next_run_date']).date())
-                
-                # Account Selection (From and To)
-                current_from = id_to_name.get(selected_row['from_account_id'])
-                current_to = id_to_name.get(selected_row['to_account_id'])
-                
-                new_from_acc = col1.selectbox("From Account", account_list, 
-                                            index=account_list.index(current_from) if current_from in account_list else None,
-                                            format_func=format_acc)
-                
-                new_to_acc = col2.selectbox("To Account", account_list, 
-                                          index=account_list.index(current_to) if current_to in account_list else None,
-                                          format_func=format_acc)
-                
-                if st.form_submit_button("💾 Save Changes", use_container_width=True):
-                    update_data = {
-                        "description": new_desc,
-                        "amount": new_amount,
-                        "frequency": new_freq,
-                        "next_run_date": str(new_date),
-                        "from_account_id": account_map.get(new_from_acc),
-                        "to_account_id": account_map.get(new_to_acc)
-                    }
+            with col_edit:
+                st.subheader(f"✏️ Edit: {selected_row['description']}")
+                with st.form("edit_schedule_form"):
+                    e_c1, e_c2 = st.columns(2)
+                    edit_desc = e_c1.text_input("Description", value=selected_row['description'])
+                    edit_amount = e_c2.number_input("Amount", value=float(selected_row['amount']), step=0.01)
                     
-                    supabase.table('schedule').update(update_data).eq('id', sched_id).execute()
-                    st.success("Item updated successfully!")
+                    edit_freq = e_c1.selectbox("Frequency", ["One-Time", "Daily", "Weekly", "Monthly", "Yearly"], 
+                                             index=["One-Time", "Daily", "Weekly", "Monthly", "Yearly"].index(selected_row['frequency']))
+                    edit_date = e_c2.date_input("Next Run Date", value=pd.to_datetime(selected_row['next_run_date']).date())
+                    
+                    if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                        supabase.table('schedule').update({
+                            "description": edit_desc,
+                            "amount": edit_amount,
+                            "frequency": edit_freq,
+                            "next_run_date": str(edit_date)
+                        }).eq('id', sched_id).execute()
+                        st.success("Updated!")
+                        clear_cache()
+                        st.rerun()
+
+            with col_del:
+                st.subheader("🗑️ Delete")
+                st.write("Careful, this cannot be undone.")
+                if st.button("🚨 Delete Item", use_container_width=True):
+                    supabase.table('schedule').delete().eq('id', sched_id).execute()
+                    st.success("Deleted!")
                     clear_cache()
                     st.rerun()
 
