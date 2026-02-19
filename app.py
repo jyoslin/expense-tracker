@@ -154,7 +154,7 @@ def get_accounts(show_inactive=False):
     if not show_inactive:
         df = df[df['is_active'] == True]
         
-    type_order = ['Bank', 'Credit Card', 'Custodial', 'Loan', 'Sinking Fund', 'Investment']
+    type_order = ['Bank', 'Credit Card', 'Custodial', 'Receivable', 'Loan', 'Sinking Fund', 'Investment']
     df['type'] = pd.Categorical(df['type'], categories=type_order, ordered=True)
     
     return df.sort_values(by=['type', 'sort_order', 'name']).reset_index(drop=True)
@@ -1134,7 +1134,7 @@ elif menu == "⚙️ Settings":
             column_config={
                 "type": st.column_config.SelectboxColumn(
                     "Type", 
-                    options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment"]
+                    options=["Bank", "Credit Card", "Custodial", "Sinking Fund", "Loan", "Investment", "Receivable"]
                 ),
                 "is_active": st.column_config.CheckboxColumn("Active?", default=True),
                 "goal_date": st.column_config.DateColumn("Goal Date"),
