@@ -39,10 +39,83 @@ def check_password():
 
 if not check_password():
     st.stop()
+
+def process_scheduled_transactions():
+    """
+    Checks for scheduled items that are due (next_run_date <= today).
+    1. Creates a transaction record for them.
+    2. Updates their 'next_run_date' to the future.
+    """
+    today_str = str(date.today())
+    
+    # 1. Get items due today or earlier
+    response = supabase.table('schedule').select("*").lte('next_run_date', today_str).execute()
+    due_items = response.data
+    
+    if not due_items:
+        return  # Nothing to do
+    
+    count_processed = 0
+    
+    for item in due_items:
+        # A. Determine Transaction Type based on accounts
+        # (You might need to adjust logic if you have specific 'type' columns, 
+        # but usually presence of accounts dictates type)
+        t_type = "Expense" # Default
+        if item['from_account_id'] and item['to_account_id']:
+            t_type = "Transfer"
+        elif item['to_account_id'] and not item['from_account_id']:
+            t_type = "Income"
+            
+        # B. Insert into 'transactions' table
+        # We use the 'next_run_date' as the transaction date so history is accurate
+        new_txn = {
+            "date": item['next_run_date'],
+            "description": item['description'],
+            "amount": item['amount'],
+            "category": item.get('category', 'Scheduled'),
+            "type": t_type,
+            "from_account_id": item['from_account_id'],
+            "to_account_id": item['to_account_id'],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        supabase.table('transactions').insert(new_txn).execute()
+        
+        # C. Calculate New Date or Delete if One-Time
+        current_date = datetime.strptime(item['next_run_date'], "%Y-%m-%d").date()
+        new_date = None
+        
+        freq = item['frequency']
+        if freq == 'Daily':
+            new_date = current_date + timedelta(days=1)
+        elif freq == 'Weekly':
+            new_date = current_date + timedelta(weeks=1)
+        elif freq == 'Monthly':
+            new_date = current_date + relativedelta(months=1)
+        elif freq == 'Yearly':
+            new_date = current_date + relativedelta(years=1)
+            
+        # D. Update Schedule Table
+        if freq == 'One-Time':
+            # Remove the schedule item so it doesn't run again
+            supabase.table('schedule').delete().eq('id', item['id']).execute()
+        else:
+            # Update the date for the next run
+            supabase.table('schedule').update({"next_run_date": str(new_date)}).eq('id', item['id']).execute()
+            
+        count_processed += 1
+        
+    if count_processed > 0:
+        st.toast(f"✅ Processed {count_processed} scheduled transactions!")
+        st.cache_data.clear() # Clear cache to show new balances immediately
+
 # Connect to Supabase
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
+
+process_scheduled_transactions()
 
 # --- 2. HELPER FUNCTIONS ---
 def clear_cache():
