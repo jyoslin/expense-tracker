@@ -12,11 +12,7 @@ import extra_streamlit_components as stx
 st.set_page_config(page_title="My Finance", page_icon="💰", layout="wide")
 
 # Initialize the Cookie Manager
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
-
-cookie_manager = get_cookie_manager()
+cookie_manager = stx.CookieManager()
 
 def check_password():
     # 0. Check if this device is already remembered in cookies!
