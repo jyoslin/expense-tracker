@@ -717,7 +717,7 @@ elif menu == "📝 Entry":
     if t_type == "Expense":
         is_split = st.checkbox("🔀 Split Payment (Pay from 2 sources)")
     
-    with st.form("entry_form"):
+    with st.form("entry_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         tx_date = c1.date_input("Date", datetime.today())
         
@@ -730,15 +730,15 @@ elif menu == "📝 Entry":
             col_a, col_b = st.columns(2)
             with col_a:
                 acc1 = st.selectbox("Source 1", expense_src_accounts, index=None, format_func=format_acc)
-                amt1 = st.number_input("Amount 1", min_value=0.0, format="%.2f")
+                amt1 = st.number_input("Amount 1", min_value=0.0, value=None, placeholder="0")
             with col_b:
                 acc2 = st.selectbox("Source 2", expense_src_accounts, index=None, format_func=format_acc)
-                amt2 = st.number_input("Amount 2", min_value=0.0, format="%.2f")
+                amt2 = st.number_input("Amount 2", min_value=0.0, value=None, placeholder="0")
         
         elif t_type == "Expense":
             f_acc = st.selectbox("Paid From", expense_src_accounts, index=None, format_func=format_acc)
-            amt = c2.number_input("Amount", min_value=0.01)
-
+            amt = c2.number_input("Amount", min_value=0.0, value=None, placeholder="0")
+            
         elif t_type == "Custodial Expense":
             st.warning("🔻 Empties the Virtual Custodial Account, and deducts from Actual Bank Account")
             c_a, c_b = st.columns(2)
@@ -748,8 +748,8 @@ elif menu == "📝 Entry":
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts, index=None, format_func=format_acc)
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts, index=None, format_func=format_acc)
             
-            amt = c1.number_input("Total Custodial Deduction", min_value=0.01)
-            amt_bank = c2.number_input("Actual Amount Paid from Bank", min_value=0.00)
+            amt = c1.number_input("Total Custodial Deduction", min_value=0.0, value=None, placeholder="0")
+            amt_bank = c2.number_input("Actual Amount Paid from Bank", min_value=0.0, value=None, placeholder="0")
 
         elif t_type == "Custodial In":
             st.info("🔼 Deposits Virtual money to Custodial AND Actual money to Bank")
@@ -760,8 +760,8 @@ elif menu == "📝 Entry":
             cust_acc = c_a.selectbox("Custodial Account (Virtual)", cust_opts, index=None, format_func=format_acc)
             bank_acc = c_b.selectbox("Deposit to Bank (Actual)", bank_opts, index=None, format_func=format_acc)
             
-            amt = c2.number_input("Total Amount", min_value=0.01)
-
+            amt = c2.number_input("Total Amount", min_value=0.0, value=None, placeholder="0")
+            
         elif t_type == "Sinking Fund Expense":
             st.info("🛍️ Pay for your goal using your real Bank money, and empty out the virtual Sinking Fund envelope.")
             c_a, c_b = st.columns(2)
@@ -771,17 +771,17 @@ elif menu == "📝 Entry":
             sf_acc = c_a.selectbox("Deduct from Virtual Envelope", sf_opts, index=None, format_func=format_acc)
             bank_acc = c_b.selectbox("Paid via Bank (Actual)", bank_opts, index=None, format_func=format_acc)
             
-            amt = c2.number_input("Total Amount", min_value=0.01)
+            amt = c2.number_input("Total Amount", min_value=0.0, value=None, placeholder="0")
 
         elif t_type == "Income":
             t_acc = st.selectbox("Deposit To", account_list, index=None, format_func=format_acc)
-            amt = c2.number_input("Amount", min_value=0.01)
+            amt = c2.number_input("Amount", min_value=0.0, value=None, placeholder="0")
 
         elif t_type == "Transfer":
             c_a, c_b = st.columns(2)
             f_acc = c_a.selectbox("From", non_loan_accounts, index=None, format_func=format_acc)
             t_acc = c_b.selectbox("To", account_list, index=None, format_func=format_acc)
-            amt = c2.number_input("Amount", min_value=0.01)
+            amt = c2.number_input("Amount", min_value=0.0, value=None, placeholder="0")
             
         elif t_type == "Increase Loan":
             loan_opts = df_active[df_active['type'] == 'Loan']['name'].tolist()
@@ -789,7 +789,7 @@ elif menu == "📝 Entry":
                 st.warning("No Loan accounts found.")
             else:
                 t_acc = st.selectbox("Select Loan Account", loan_opts, index=None, format_func=format_acc)
-            amt = c2.number_input("Amount to Add to Loan", min_value=0.01)
+            amt = c2.number_input("Amount to Add to Loan", min_value=0.0, value=None, placeholder="0")
 
         df_cats_full = get_categories()
         cat_options = []
@@ -825,6 +825,10 @@ elif menu == "📝 Entry":
                 st.error("❌ Please select a Loan account.")
             elif t_type == "Increase Loan" and not desc.strip():
                 st.error("❌ Description is MANDATORY when increasing a loan.")
+            elif t_type == "Expense" and is_split and (not amt1 or not amt2):
+                st.error("❌ Please enter both amounts for the split.")
+            elif not is_split and (amt is None or amt <= 0):
+                st.error("❌ Please enter a valid amount.")
             else:
                 import time
                 batch_id = f" [Batch:{int(time.time() * 1000)}]"
