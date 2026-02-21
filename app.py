@@ -32,13 +32,18 @@ def check_password():
         
     # 2. Fallback: Standard password box if URL token is missing
     def password_entered():
-        if hmac.compare_digest(st.session_state["password"], st.secrets["APP_PASSWORD"]):
+        # Safely get the password using .get() to avoid KeyErrors
+        entered_pw = st.session_state.get("password", "")
+        
+        if hmac.compare_digest(entered_pw, st.secrets["APP_PASSWORD"]):
             st.session_state["password_correct"] = True
             
             # Save a cookie to remember this device for 1 year
             cookie_manager.set("remember_device", "true", max_age=31536000)
             
-            del st.session_state["password"]
+            # We removed 'del st.session_state["password"]' here.
+            # Streamlit automatically cleans up the password from memory 
+            # as soon as the login box is hidden!
         else:
             st.session_state["password_correct"] = False
 
